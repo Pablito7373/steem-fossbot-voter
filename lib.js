@@ -1491,7 +1491,7 @@ function sendRunEmail(options, callback) {
 
 function sendRunEmailNow(options, callback) {
   persistentLog(LOG_GENERAL, "send email now...");
-  var email = "<html><body><h1>Update: runBot iteration finished successfully</h1>";
+  var email = "<html><body><h1>Aggiornamento: VoterBot ha completato con successo .</h1>";
   email += "<h3>at "+moment_tz.tz((new Date()).getTime(), configVars.TIME_ZONE).format("MMM Do YYYY HH:mm")+"</h3>";
   //algorithmSet
   if (!algorithmSet) {
@@ -1546,32 +1546,32 @@ function sendRunEmailNow(options, callback) {
   }
   //var weightsHtml = JSON.stringify(algorithm.weights, null, 4);
   //email += "<p>"+weightsHtml+"</p>";
-  email += "<h3>White and black lists</h3>";
-  email += "<p>Author whitelist: "+JSON.stringify(algorithm.authorWhitelist)+"</p>";
-  email += "<p>Author blacklist: "+JSON.stringify(algorithm.authorBlacklist)+"</p>";
-  email += "<p>Content category whitelist: "+JSON.stringify(algorithm.contentCategoryWhitelist)+"</p>";
-  email += "<p>Content category blacklist: "+JSON.stringify(algorithm.contentCategoryBlacklist)+"</p>";
-  email += "<p>Content word whitelist: "+JSON.stringify(algorithm.contentWordWhitelist)+"</p>";
-  email += "<p>Content word blacklist: "+JSON.stringify(algorithm.contentWordBlacklist)+"</p>";
-  email += "<p>Domain whitelist: "+JSON.stringify(algorithm.domainWhitelist)+"</p>";
-  email += "<p>Domain blacklist: "+JSON.stringify(algorithm.domainBlacklist)+"</p>";
-  email += "<h3>Averaging window</h3>";
-  email += "<p>Averaging window size (in posts): "+configVars.NUM_POSTS_FOR_AVG_WINDOW+"</p>";
-  email += "<p>Current score threshold: "+avgWindowInfo.scoreThreshold+"</p>";
-  email += "<p>Percentage add to threshold: "+(configVars.SCORE_THRESHOLD_INC_PC*100)+"%</p>";
-  email += "<p>Number of votes today: "+owner.num_votes_today+" + "+numVoteOn+" now = "+(owner.num_votes_today+numVoteOn)+"</p>";
+  //email += "<h3>White and black lists</h3>";
+  //email += "<p>Author whitelist: "+JSON.stringify(algorithm.authorWhitelist)+"</p>";
+  //email += "<p>Author blacklist: "+JSON.stringify(algorithm.authorBlacklist)+"</p>";
+  //email += "<p>Content category whitelist: "+JSON.stringify(algorithm.contentCategoryWhitelist)+"</p>";
+  //email += "<p>Content category blacklist: "+JSON.stringify(algorithm.contentCategoryBlacklist)+"</p>";
+  //email += "<p>Content word whitelist: "+JSON.stringify(algorithm.contentWordWhitelist)+"</p>";
+  //email += "<p>Content word blacklist: "+JSON.stringify(algorithm.contentWordBlacklist)+"</p>";
+  //email += "<p>Domain whitelist: "+JSON.stringify(algorithm.domainWhitelist)+"</p>";
+  //email += "<p>Domain blacklist: "+JSON.stringify(algorithm.domainBlacklist)+"</p>";
+  //email += "<h3>Averaging window</h3>";
+  //email += "<p>Averaging window size (in posts): "+configVars.NUM_POSTS_FOR_AVG_WINDOW+"</p>";
+  //email += "<p>Current score threshold: "+avgWindowInfo.scoreThreshold+"</p>";
+  //email += "<p>Percentage add to threshold: "+(configVars.SCORE_THRESHOLD_INC_PC*100)+"%</p>";
+  //email += "<p>Number of votes today: "+owner.num_votes_today+" + "+numVoteOn+" now = "+(owner.num_votes_today+numVoteOn)+"</p>";
   //email += "<p>Added to threshold to adjust for todays votes: "+avgWindowInfo.lastThresholdUpAdjust+"</p>";
-  email += "<h3>Misc constant settings</h3>";
-  email += "<p>Max posts to get: "+configVars.MAX_POST_TO_READ+"</p>";
-  email += "<p>Dolpin min SP: "+configVars.CAPITAL_DOLPHIN_MIN+"</p>";
-  email += "<p>Whale min SP: "+configVars.CAPITAL_WHALE_MIN+"</p>";
-  email += "<p>Key detector, min keyword length: "+configVars.MIN_KEYWORD_LEN+"</p>";
+  //email += "<h3>Misc constant settings</h3>";
+  //email += "<p>Max posts to get: "+configVars.MAX_POST_TO_READ+"</p>";
+  //email += "<p>Dolpin min SP: "+configVars.CAPITAL_DOLPHIN_MIN+"</p>";
+  //email += "<p>Whale min SP: "+configVars.CAPITAL_WHALE_MIN+"</p>";
+  //email += "<p>Key detector, min keyword length: "+configVars.MIN_KEYWORD_LEN+"</p>";
   //email += "<h2>Raw results metadata:</h2>";
   //var metadataHtml = JSON.stringify(postsMetadata, null, 4);
   //email += "<p>"+metadataHtml+"</p>";
-  email += "<h3>Process logs:</h3>";
-  email += "<p>"+logHtml+"</p>";
-  email += "</body></html>";
+  //email += "<h3>Process logs:</h3>";
+  //email += "<p>"+logHtml+"</p>";
+  //email += "</body></html>";
   sendEmail("Voter bot", email, true, function () {
     persistString("last_log_html", email, function(err) {
       if (err) {
