@@ -1544,7 +1544,7 @@ function sendRunEmailNow(options, callback) {
   } else {
     email += "<p><span style=\"color: red;\">No weights! Please set in algorithm</span></p>";
   }
-  //var weightsHtml = JSON.stringify(algorithm.weights, null, 4);
+  var weightsHtml = JSON.stringify(algorithm.weights, null, 4);
   //email += "<p>"+weightsHtml+"</p>";
   //email += "<h3>White and black lists</h3>";
   //email += "<p>Author whitelist: "+JSON.stringify(algorithm.authorWhitelist)+"</p>";
