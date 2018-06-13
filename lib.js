@@ -158,8 +158,6 @@ const
 const
 	steem = require("steem"),
   Q = require("q"),
-  redis = require("redis"),
-  redisClient = require('redis').createClient(process.env.REDIS_URL),
   Glossary = require("glossary"),
   S = require('string'),
   strip = require('strip-markdown'),
@@ -172,7 +170,17 @@ const
   LanguageDetect = require('languagedetect'),
   langDetector = new LanguageDetect(),
   moment_tz = require('moment-timezone'),
-  moment = require('moment');
+  moment = require('moment'),
+  mongodb = require("mongodb");
+
+const
+  DB_GENERAL = "general",
+  DB_ALGORITHM = "algorithm",
+  DB_CONFIG_VARS = "config_vars",
+  DB_AVG_WINDOW_INFO = "avg_window_info",
+  DB_LAST_POST = "last_post",
+  DB_DAILY_LIKED_POSTS = "daily_liked_posts",
+  DB_POSTS_METADATA = "posts_metadata";
 
 const
   MILLIS_IN_DAY = 86400000,
@@ -186,38 +194,44 @@ var defaultConfigVars = {
   MIN_SCORE_THRESHOLD: 10,
   SCORE_THRESHOLD_INC_PC: 0.1,
   NUM_POSTS_FOR_AVG_WINDOW: 10,
-  MAX_VOTES_IN_24_HOURS: 50,
   MIN_WORDS_FOR_ARTICLE: 100,
   DAYS_KEEP_LOGS: 2,
   MIN_POST_AGE_TO_CONSIDER: 21.22,
   MIN_LANGUAGE_USAGE_PC: 0.1,
   TIME_ZONE: "Etc/GMT+3",
-  EMAIL_DIGEST: 0,
-  MIN_KEYWORD_FREQ: 3
+  MIN_KEYWORD_FREQ: 3,
+  MIN_VOTING_POWER: 50,
+  VOTE_VOTING_POWER: 100,
+  POST_METADATA_MAX_RECORD_PER_RUN: 100,
+  POST_METADATA_MAX_RUNS_TO_KEEP: 5,
+  COMMENT_ENABLED: 'off'
 };
 
 var configVars = {
-  MAX_POST_TO_READ: 400,
+  MAX_POST_TO_READ: 800,
   CAPITAL_DOLPHIN_MIN: 25000,
   CAPITAL_WHALE_MIN: 100000,
   MIN_KEYWORD_LEN: 4,
   MIN_SCORE_THRESHOLD: 10,
   SCORE_THRESHOLD_INC_PC: 0.1,
   NUM_POSTS_FOR_AVG_WINDOW: 10,
-  MAX_VOTES_IN_24_HOURS: 50,
   MIN_WORDS_FOR_ARTICLE: 100,
   DAYS_KEEP_LOGS: 2,
   MIN_POST_AGE_TO_CONSIDER: 30,
   MIN_LANGUAGE_USAGE_PC: 0.1,
   TIME_ZONE: "Etc/GMT+3",
-  EMAIL_DIGEST: 0,
-  MIN_KEYWORD_FREQ: 3
+  MIN_KEYWORD_FREQ: 3,
+  MIN_VOTING_POWER: 50,
+  VOTE_VOTING_POWER: 100,
+  POST_METADATA_MAX_RECORD_PER_RUN: 100,
+  POST_METADATA_MAX_RUNS_TO_KEEP: 5,
+  COMMENT_ENABLED: 'off'
 };
 
-/* Private variables */
-var fatalError = false;
-var serverState = "stopped";
+// MongoDB
+var db;
 
+/* Private variables */
 var steemGlobalProperties = {};
 
 // algorithm
@@ -231,7 +245,8 @@ var algorithm = {
   contentWordWhitelist: [],
   contentWordBlacklist: [],
   domainWhitelist: [],
-  domainBlacklist: []
+  domainBlacklist: [],
+  comment: ''
 };
 var algorithmUsesVotingAnalysis = false;
 var algorithmUsesAuthorAnalysis = false;
@@ -248,7 +263,6 @@ var owner = {};
 var postsMetrics = [];
 // resulting
 var postsMetadata = [];
-var dailyLikedPosts = [];
 
 // other
 var avgWindowInfo = {
@@ -297,23 +311,31 @@ runBot(messageCallback):
 * Process a bot iteration
 */
 function runBot(callback, options) {
-  setupLogging();
   persistentLog(LOG_GENERAL, "runBot started...");
-  persistentLog(LOG_VERBOSE, "mainLoop: started, state: "+serverState);
-  // first, check bot can run
-  if (fatalError) {
-    sendEmail("Voter bot", "Update: runBot could not run: [fatalError with state: "+serverState+"]", function () {
-      if (callback) {
-        callback({status: 500, message: "Server in unusable state, cannot run bot"});
-      }
-    });
-    return;
-  }
   // begin bot logic, use promises with Q
   // some general vars
   var timeNow = new Date();
   // define steps processes
   var processes = [
+    // initial vote power check
+    function () {
+      persistentLog(LOG_GENERAL, "checking we have enough voting power...");
+      var deferred = Q.defer();
+      // get posts
+      if (isNaN(owner.voting_power) || owner.voting_power <= 0) {
+        throw {message: "Zero voting power or error getting voting power: vp = (" + owner.voting_power};
+      }
+      var percentageVp = owner.voting_power / 100;
+      persistentLog(LOG_VERBOSE, "Enough voting power ("+percentageVp+" < "+configVars.MIN_VOTING_POWER+") ?");
+      if (percentageVp < configVars.MIN_VOTING_POWER) {
+        persistentLog(LOG_GENERAL, " - voting power "+percentageVp+
+          " is less than config min of " + configVars.MIN_VOTING_POWER+
+          ", will not continue");
+        throw {message: "Not enough voting power ("+percentageVp+" < "+configVars.MIN_VOTING_POWER+")"};
+      }
+      deferred.resolve(true);
+      return deferred.promise;
+    },
     // pre set up
     function () {
       numVoteOn = 0;
@@ -321,9 +343,10 @@ function runBot(callback, options) {
       persistentLog(LOG_GENERAL, "pre set up...");
       var deferred = Q.defer();
       // update average window details
-      getPersistentJson("avg_window_info", function(err, info) {
+      getPersistentObj(DB_AVG_WINDOW_INFO, function(err, info) {
         if (err || info === undefined || info == null) {
-          persistentLog(LOG_VERBOSE, " - no avgWindowInfo in redis store, probably first time bot run");
+          persistentLog(LOG_VERBOSE, " - no avgWindowInfo in db, probably" +
+            " first time bot run");
           avgWindowInfo = {
             scoreThreshold: 0,
             postScores: [],
@@ -331,12 +354,12 @@ function runBot(callback, options) {
           };
         } else {
           avgWindowInfo = info;
-          persistentLog(LOG_VERBOSE, " - updated avgWindowInfo from redis store: "+JSON.stringify(avgWindowInfo));
+          persistentLog(LOG_VERBOSE, " - updated avgWindowInfo from db: "+JSON.stringify(avgWindowInfo));
         }
-        getPersistentJson("algorithm", function(err, algorithmResult) {
-          if (err) {
+        getPersistentObj(DB_ALGORITHM, function(err, algorithmResult) {
+          if (err || algorithmResult === undefined || algorithmResult === null) {
             algorithmSet = false;
-            persistentLog(LOG_VERBOSE, " - no algorithm in redis store, empty");
+            persistentLog(LOG_VERBOSE, " - no algorithm in db, empty");
             algorithm = {
               weights: [],
               authorWhitelist: [],
@@ -360,7 +383,7 @@ function runBot(callback, options) {
           } else {
             algorithmSet = true;
             algorithm = algorithmResult;
-            persistentLog(LOG_VERBOSE, " - updated algorithm from redis store: "+JSON.stringify(algorithm));
+            persistentLog(LOG_VERBOSE, " - updated algorithm from db: "+JSON.stringify(algorithm));
           }
           // determine which analysis needs to be run depending on algorithm keys used
           for (var i = 0 ; i < algorithm.weights.length ; i++) {
@@ -396,13 +419,15 @@ function runBot(callback, options) {
               break;
             }
           }
-          getPersistentJson("daily_liked_posts", function(err, dailyLikedPostsResults) {
-            if (dailyLikedPostsResults != null) {
-              dailyLikedPosts = dailyLikedPostsResults.data;
+          getPersistentObj(DB_CONFIG_VARS, function(err, configVarsResult) {
+            if (err || configVarsResult === undefined || configVarsResult === null) {
+              persistentLog(LOG_VERBOSE, " - couldnt update config, using default: "+JSON.stringify(configVars));
+            } else {
+              configVars = configVarsResult;
+              persistentLog(LOG_VERBOSE, " - updated config from db: "+JSON.stringify(configVars));
             }
             deferred.resolve(true);
           });
-
         });
       });
       return deferred.promise;
@@ -486,7 +511,7 @@ function runBot(callback, options) {
       // update last fetched post
       if (options == null || !options.hasOwnProperty("test") || !options.test ) {
         lastPost = posts[0];
-        persistJson("lastpost", lastPost);
+        persistObj(DB_LAST_POST, lastPost, function(err, data) {});
       } else {
         persistentLog(LOG_VERBOSE, "didn't set lastpost, this is a test run");
       }
@@ -495,7 +520,7 @@ function runBot(callback, options) {
       deferred.resolve(true);
       return deferred.promise;
     },
-    // transform post data to metrics 1, get owner metrics 
+    // transform post data to metrics 1, get owner metrics
     function () {
       persistentLog(LOG_GENERAL, "metrics generation 1: owner metrics...");
       var deferred = Q.defer();
@@ -556,13 +581,15 @@ function runBot(callback, options) {
         persistentLog(LOG_VERBOSE, " - - metrics.post.post_num_upvotes: "+metric.post_num_upvotes);
         persistentLog(LOG_VERBOSE, " - - metrics.post.post_num_downvotes: "+metric.post_num_downvotes);
         // add author and voters to user fetch list
-        fetchUsers.push(posts[i].author);
+        if (users[posts[i].author] == undefined || users[posts[i].author] == null) {
+          fetchUsers.push(posts[i].author);
+        }
         for (var j = 0 ; j < posts[i].active_votes.length ; j++) {
           //persistentLog(LOG_VERBOSE, " - - - ["+j+"]: "+JSON.stringify(posts[i].active_votes[j]));
           var voter = posts[i].active_votes[j].voter;
           // make sure this voter isn't the owner user
           if (voter.localeCompare(process.env.STEEM_USER) != 0) {
-            if (!users[voter]) {
+            if (users[voter] == undefined || users[voter] == null) {
               fetchUsers.push(voter);
             }
           }
@@ -572,22 +599,21 @@ function runBot(callback, options) {
       }
       // get relevant users account details, used in next step
       if (fetchUsers.length > 0) {
+        persistentLog(LOG_VERBOSE, ' - fetching info for ' + fetchUsers.length + 'users: ' + JSON.stringify(fetchUsers));
         // get user info
-        steem.api.getAccounts(fetchUsers, function(err, userAccounts) {
-          if (err) {
-            persistentLog(LOG_GENERAL, " - error, can't get "+voter+" votes: "+err.message);
+        addAccountsToUserList_recursive(fetchUsers, 0, function (err, success) {
+          if (err || !success) {
+            persistentLog(LOG_GENERAL, ' - error, cant get user accounts: ' + err);
           } else {
-            for (var k = 0 ; k < userAccounts.length ; k++) { 
-              users[userAccounts[k].name] = userAccounts[k];
-            }
+            persistentLog(LOG_VERBOSE, ' - fetched user account info');
           }
           // finish
-          persistentLog(LOG_VERBOSE, " - - finished getting voters for post");
+          persistentLog(LOG_VERBOSE, ' - - finished getting voters for post');
           deferred.resolve(true);
         });
       } else {
         // finish
-        persistentLog(LOG_VERBOSE, " - - no voters account information to get for post");
+        persistentLog(LOG_VERBOSE, ' - - no account information to get for all posts');
         deferred.resolve(true);
       }
       // return promise
@@ -619,7 +645,7 @@ function runBot(callback, options) {
           //persistentLog(LOG_VERBOSE, " - - - ["+j+"]: "+JSON.stringify(posts[i].active_votes[j]));
           var voter = posts[i].up_votes[j].voter;
           if (voter.localeCompare(process.env.STEEM_USER) != 0
-              && users[voter]) {
+              && users[voter] !== undefined && users[voter] !== null) {
             var voterAccount = users[voter];
             // determine if dolphin or whale, count
             var steemPower = getSteemPowerFromVest(voterAccount.vesting_shares);
@@ -663,7 +689,7 @@ function runBot(callback, options) {
           //persistentLog(LOG_VERBOSE, " - - - ["+j+"]: "+JSON.stringify(posts[i].active_votes[j]));
           var voter = posts[i].down_votes[j].voter;
           if (voter.localeCompare(process.env.STEEM_USER) != 0
-            && users[voter]) {
+            && users[voter] !== undefined && users[voter] !== null) {
             var voterAccount = users[voter];
             // determine if dolphin or whale, count
             var steemPower = getSteemPowerFromVest(voterAccount.vesting_shares);
@@ -716,11 +742,11 @@ function runBot(callback, options) {
       for (var i = 0 ; i < postsMetrics.length ; i++) {
         persistentLog(LOG_VERBOSE, " - postsMetrics ["+i+"]");
         // check we have author account, we should
-        if (users[posts[i].author]) {
+        if (users[posts[i].author] !== undefined && users[posts[i].author] != null) {
           // get capital value
           var steemPower = getSteemPowerFromVest(users[posts[i].author].vesting_shares);
-          //metrics.author.capital_val: Capital (Steem Power) by value 
-          postsMetrics[i].author_capital_val = steemPower; 
+          //metrics.author.capital_val: Capital (Steem Power) by value
+          postsMetrics[i].author_capital_val = steemPower;
           if (steemPower >= configVars.CAPITAL_WHALE_MIN) {
             postsMetrics[i].author_is_minnow = 0;
             postsMetrics[i].author_is_dolphin = 0;
@@ -870,8 +896,8 @@ function runBot(callback, options) {
               //persistentLog(LOG_VERBOSE, " - - checking tags: "+metadata.tags);
               for (var j = 0 ; j < metadata.tags.length ; j++) {
                 var tag = metadata.tags[j];
-                postsMetrics[i].post_num_tags_whitelisted += (algorithm.contentCategoryWhitelist.indexOf(tag) > 0) ? 1 : 0;
-                postsMetrics[i].post_num_tags_blacklisted += (algorithm.contentCategoryBlacklist.indexOf(tag) > 0) ? 1 : 0;
+                postsMetrics[i].post_num_tags_whitelisted += (algorithm.contentCategoryWhitelist.indexOf(tag) >= 0) ? 1 : 0;
+                postsMetrics[i].post_num_tags_blacklisted += (algorithm.contentCategoryBlacklist.indexOf(tag) >= 0) ? 1 : 0;
               }
             } else {
               persistentLog(LOG_VERBOSE, " - - no tags to check");
@@ -889,14 +915,14 @@ function runBot(callback, options) {
         //persistentLog(LOG_VERBOSE, " - - checking keywords");
         for (var j = 0 ; j < nlp.keywords.length ; j++) {
           var keyword = nlp.keywords[j];
-          postsMetrics[i].post_num_keywords_whitelisted += (algorithm.contentWordWhitelist.indexOf(keyword) > 0) ? 1 : 0;
-          postsMetrics[i].post_num_keywords_blacklisted += (algorithm.contentWordBlacklist.indexOf(keyword) > 0) ? 1 : 0;
-          postsMetrics[i].post_num_words_whitelisted += (nlp.content.indexOf(keyword) > 0) ? 1 : 0;
-          postsMetrics[i].post_num_words_blacklisted += (nlp.content.indexOf(keyword) > 0) ? 1 : 0;
+          postsMetrics[i].post_num_keywords_whitelisted += (algorithm.contentWordWhitelist.indexOf(keyword) >= 0) ? 1 : 0;
+          postsMetrics[i].post_num_keywords_blacklisted += (algorithm.contentWordBlacklist.indexOf(keyword) >= 0) ? 1 : 0;
+          postsMetrics[i].post_num_words_whitelisted += (nlp.content.indexOf(keyword) >= 0) ? 1 : 0;
+          postsMetrics[i].post_num_words_blacklisted += (nlp.content.indexOf(keyword) >= 0) ? 1 : 0;
         }
         // - bool
-        postsMetrics[i].post_category_whitelisted = (algorithm.contentCategoryWhitelist.indexOf(posts[i].category) > 0) ? 1 : 0;
-        postsMetrics[i].post_category_blacklisted = (algorithm.contentCategoryBlacklist.indexOf(posts[i].category) > 0) ? 1 : 0;
+        postsMetrics[i].post_category_whitelisted = (algorithm.contentCategoryWhitelist.indexOf(posts[i].category) >= 0) ? 1 : 0;
+        postsMetrics[i].post_category_blacklisted = (algorithm.contentCategoryBlacklist.indexOf(posts[i].category) >= 0) ? 1 : 0;
         postsMetrics[i].post_any_tag_whitelisted = (postsMetrics[i].post_num_tags_whitelisted > 0) ? 1 : 0;
         postsMetrics[i].post_any_tag_blacklisted = (postsMetrics[i].post_num_tags_blacklisted > 0) ? 1 : 0;
         postsMetrics[i].post_any_keyword_whitelisted = (postsMetrics[i].post_num_keywords_whitelisted > 0) ? 1 : 0;
@@ -906,7 +932,7 @@ function runBot(callback, options) {
         postsMetrics[i].post_num_links_video = 0;
         postsMetrics[i].post_num_links_image = 0;
         postsMetrics[i].post_num_links_page = 0;
-        postsMetrics[i].post_num_links_total = 0; 
+        postsMetrics[i].post_num_links_total = 0;
         postsMetrics[i].post_num_link_domains_whitelisted = 0;
         postsMetrics[i].post_num_link_domains_blacklisted = 0;
         //persistentLog(LOG_VERBOSE, " - - classifying urls");
@@ -953,8 +979,8 @@ function runBot(callback, options) {
             postsMetrics[i].post_num_links_page++;
           }
           // check for domain presence on white / black list
-          postsMetrics[i].post_num_link_domains_whitelisted += (algorithm.domainWhitelist.indexOf(domain) > 0) ? 1 : 0;
-          postsMetrics[i].post_num_link_domains_blacklisted += (algorithm.domainBlacklist.indexOf(domain) > 0) ? 1 : 0;
+          postsMetrics[i].post_num_link_domains_whitelisted += (algorithm.domainWhitelist.indexOf(domain) >= 0) ? 1 : 0;
+          postsMetrics[i].post_num_link_domains_blacklisted += (algorithm.domainBlacklist.indexOf(domain) >= 0) ? 1 : 0;
           // Content - complex, using more than one other metric to create a metric
           postsMetrics[i].post_very_short = 0;
           postsMetrics[i].post_images_only = 0;
@@ -1061,14 +1087,14 @@ function runBot(callback, options) {
             scoreDetail.metrics.push(metricScore);
             persistentLog(LOG_VERBOSE, " - - - - "+algorithm.weights[j].key+": "+value+" * weight("+weight+") = "+metricScore.score);
           } else {
-            persistentLog(LOG_VERBOSE, " - - - - error, key not found in metrics: "+weight);
+            persistentLog(LOG_VERBOSE, " - - - - error, key not found in metrics: "+algorithm.weights[j].key);
           }
         }
         persistentLog(LOG_VERBOSE, " - - FINAL SCORE: "+scoreDetail.total);
         postsMetadata.push(
           {
             title: posts[i].title,
-            url: "https://steemit.com"+posts[i].url,
+            url: 'https://steemit.com' + posts[i].url,
             author: posts[i].author,
             time: posts[i].created,
             cur_est_payout: postsMetrics[i].post_est_payout,
@@ -1078,7 +1104,7 @@ function runBot(callback, options) {
             score: scoreDetail.total,
             scoreDetail: scoreDetail,
             permlink: posts[i].permlink,
-            vote: false //may be set to true in next process
+            vote: false // may be set to true in next process
           });
       }
       deferred.resolve(true);
@@ -1086,236 +1112,234 @@ function runBot(callback, options) {
     },
     // choose posts to vote on based on scores
     function () {
-      persistentLog(LOG_GENERAL, "choose posts to vote on based on scores...");
+      persistentLog(LOG_GENERAL, "choose posts to vote on based on" +
+        " scores and vote...");
       var deferred = Q.defer();
-      var upVotesProcessed = 0;
-      var isFirst = true;
-      var avgWindowInfo_copy = clone(avgWindowInfo);
-      // perform check, if this is the first time the bot is run, make the threshold window out of the first
-      //    NUM_POSTS_FOR_AVG_WINDOW number of posts, or less if not that many are equal to or above MIN_SCORE_THRESHOLD
-      if (avgWindowInfo.postScores.length == 0) {
-        persistentLog(LOG_VERBOSE, " - first bot run, looking ahead to create scores window");
-        var count = 0;
-        for (var i = 0 ; i < posts.length ; i++) {
+      wait.launchFiber(function() {
+        var upVotesProcessed = 0;
+        var isFirst = true;
+        var avgWindowInfo_copy = clone(avgWindowInfo);
+        // perform check, if this is the first time the bot is run, make the threshold window out of the first
+        //    NUM_POSTS_FOR_AVG_WINDOW number of posts, or less if not that many are equal to or above MIN_SCORE_THRESHOLD
+        if (avgWindowInfo.postScores.length == 0) {
+          persistentLog(LOG_VERBOSE, " - first bot run, looking ahead to create scores window");
+          var count = 0;
+          for (var i = 0; i < posts.length; i++) {
+            if (postsMetadata[i].score >= configVars.MIN_SCORE_THRESHOLD) {
+              avgWindowInfo.postScores.push(postsMetadata[i].score);
+              if (count++ >= configVars.NUM_POSTS_FOR_AVG_WINDOW) {
+                break;
+              }
+            }
+          }
+          persistentLog(LOG_VERBOSE, " - created window from " + count + " scores");
+        }
+        for (var i = 0; i < posts.length; i++) {
+          var thresholdInfo = {
+            min: configVars.MIN_SCORE_THRESHOLD
+          };
+          // add this score first, if meets minimum
           if (postsMetadata[i].score >= configVars.MIN_SCORE_THRESHOLD) {
             avgWindowInfo.postScores.push(postsMetadata[i].score);
-            if (count++ >= configVars.NUM_POSTS_FOR_AVG_WINDOW) {
-              break;
+          }
+          // recalculate avgerage based on window value
+          persistentLog(LOG_VERBOSE, " - - recalculating score threshold with window:" + JSON.stringify(avgWindowInfo.postScores));
+          // calculate average
+          var avg = 0;
+          var maxScore = configVars.MIN_SCORE_THRESHOLD;
+          var count = 0;
+          for (var j = 0; j < avgWindowInfo.postScores.length; j++) {
+            if (avgWindowInfo.postScores[j] > configVars.MIN_SCORE_THRESHOLD) {
+              avg += avgWindowInfo.postScores[j];
+              count++;
+              if (avgWindowInfo.postScores[j] > maxScore) {
+                maxScore = avgWindowInfo.postScores[j];
+              }
             }
           }
-        }
-        persistentLog(LOG_VERBOSE, " - created window from "+count+" scores");
-      }
-      for (var i = 0 ; i < posts.length ; i++) {
-        var thresholdInfo = {
-          min: configVars.MIN_SCORE_THRESHOLD
-        };
-        // add this score first, if meets minimum
-        if (postsMetadata[i].score >= configVars.MIN_SCORE_THRESHOLD) {
-        	avgWindowInfo.postScores.push(postsMetadata[i].score);
-        }
-        // recalculate avgerage based on window value
-        persistentLog(LOG_VERBOSE, " - - recalculating score threshold with window:"+JSON.stringify(avgWindowInfo.postScores));
-        // calculate average
-        var avg = 0;
-        var maxScore = configVars.MIN_SCORE_THRESHOLD;
-        var count = 0;
-        for (var j = 0 ; j < avgWindowInfo.postScores.length ; j++) {
-          if (avgWindowInfo.postScores[j] > configVars.MIN_SCORE_THRESHOLD) {
-            avg += avgWindowInfo.postScores[j];
-            count++;
-            if (avgWindowInfo.postScores[j] > maxScore) {
-              maxScore = avgWindowInfo.postScores[j];
+          if (count > 0) {
+            avg /= count;
+          }
+          thresholdInfo.average = avg;
+          // calculate variance
+          var variance = 0;
+          for (var j = 0; j < avgWindowInfo.postScores.length; j++) {
+            if (avgWindowInfo.postScores[j] > configVars.MIN_SCORE_THRESHOLD) {
+              variance += Math.pow(avgWindowInfo.postScores[j] - avg, 2);
             }
           }
-        }
-        if (count > 0) {
-          avg /= count;
-        }
-        thresholdInfo.average = avg;
-        // calculate variance
-        var variance = 0;
-        for (var j = 0 ; j < avgWindowInfo.postScores.length ; j++) {
-          if (avgWindowInfo.postScores[j] > configVars.MIN_SCORE_THRESHOLD) {
-            variance += Math.pow(avgWindowInfo.postScores[j] - avg, 2);
+          if (count > 0) {
+            variance /= count;
           }
-        }
-        if (count > 0) {
-          variance /= count;
-        }
-        thresholdInfo.variance = variance;
-        // calculate threshold
-        var threshold = avg;
-        if (threshold < configVars.MIN_SCORE_THRESHOLD) {
-          threshold = configVars.MIN_SCORE_THRESHOLD;
-          // stats
-          thresholdInfo.percentInc = 0;
-          thresholdInfo.voteAdjustmentInc = 0;
-          thresholdInfo.total = threshold;
-        } else {
-          // first apply percentage increase on threshold,
-          //   i.e. must be SCORE_THRESHOLD_INC_PC % better than average to be selected
-          // #74, as of this ticket, use as percentage of variance, but cannot exceed same
-          //    percentage of threshold (average)
-          thresholdInfo.percentInc = variance * configVars.SCORE_THRESHOLD_INC_PC;
-          if (thresholdInfo.percentInc > (threshold * configVars.SCORE_THRESHOLD_INC_PC)) {
-            thresholdInfo.percentInc = threshold * configVars.SCORE_THRESHOLD_INC_PC;
-          }
-          threshold += thresholdInfo.percentInc;
-          // then add more (make more unlikely to vote on) proportional to how many votes already
-          //   cast today. if there are max or exceeding max voted, threshold will be too high for
-          //   vote and no post will be voted on, thus maintaining limit
-          // #27, removed square scaling of vote limit
-          thresholdInfo.voteAdjustmentInc = (maxScore - threshold) * ((owner.num_votes_today + upVotesProcessed)/ configVars.MAX_VOTES_IN_24_HOURS);
-          if (thresholdInfo.voteAdjustmentInc < 0) {
-            thresholdInfo.voteAdjustmentInc = 0;
-          }
-          threshold += thresholdInfo.voteAdjustmentInc;
-          thresholdInfo.total = threshold;
-          if (thresholdInfo.total < configVars.MIN_SCORE_THRESHOLD) {
-            thresholdInfo.total = configVars.MIN_SCORE_THRESHOLD;
-          }
-        }
-        avgWindowInfo.scoreThreshold = thresholdInfo.total;
-        postsMetadata[i].thresholdInfo = thresholdInfo;
-        persistentLog(LOG_VERBOSE, " - - - new avg / score threshold: "+avgWindowInfo.scoreThreshold);
-        persistentLog(LOG_VERBOSE, " - - - - new threshold info: "+JSON.stringify(thresholdInfo));
-        // prune scores in window list to keep at NUM_POSTS_FOR_AVG_WINDOW size
-        if ((avgWindowInfo.postScores.length - configVars.NUM_POSTS_FOR_AVG_WINDOW) >= 0) {
-          var newScoresWindow = [];
-          for (var j = avgWindowInfo.postScores.length - configVars.NUM_POSTS_FOR_AVG_WINDOW ; j < avgWindowInfo.postScores.length ; j++) {
-            newScoresWindow.push(avgWindowInfo.postScores[j]);
-          }
-          avgWindowInfo.postScores = newScoresWindow;
-        }
+          thresholdInfo.variance = variance;
+          // calculate threshold
+          var threshold = avg;
+          if (threshold < configVars.MIN_SCORE_THRESHOLD) {
+            threshold = configVars.MIN_SCORE_THRESHOLD;
+            // stats
+            thresholdInfo.percentInc = 0;
+            thresholdInfo.total = threshold;
+          } else {
+            // first apply percentage increase on threshold,
+            //   i.e. must be SCORE_THRESHOLD_INC_PC % better than average to be selected
+            // #74, as of this ticket, use as percentage of variance, but cannot exceed same
+            //    percentage of threshold (average)
+            thresholdInfo.percentInc = variance * configVars.SCORE_THRESHOLD_INC_PC;
+            if (thresholdInfo.percentInc > (threshold * configVars.SCORE_THRESHOLD_INC_PC)) {
+              thresholdInfo.percentInc = threshold * configVars.SCORE_THRESHOLD_INC_PC;
+            }
+            threshold += thresholdInfo.percentInc;
+            // #90, removed thresholdInfo.voteAdjustmentInc completely as
+            //   is now obsolete due to removal of MAX_VOTES_IN_24_HOURS
+            // #7 : add vote throttling based on voting power closeness
+            //   to minimum
+            var vpDiffFrom100 = (100 - (owner.voting_power / 100));
+            if (vpDiffFrom100 > 0) {
+              thresholdInfo.voteAdjustmentInc = (maxScore - threshold)
+                * (vpDiffFrom100 / (100 - configVars.MIN_VOTING_POWER));
+              if (thresholdInfo.voteAdjustmentInc < 0) {
+                thresholdInfo.voteAdjustmentInc = 0;
+              }
+              threshold += thresholdInfo.voteAdjustmentInc;
+            } // else nothing to add
 
-        // check if post score is above threshold, set to vote if is
-        if (postsMetadata[i].score >= avgWindowInfo.scoreThreshold) {
-          postsMetadata[i].vote = true;
-          upVotesProcessed++;
-          persistentLog(LOG_VERBOSE, " - - "+postsMetadata[i].score+" >= "+avgWindowInfo.scoreThreshold+", WILL vote on post ["+posts[i].permlink+"]");
-          if (options == null || !options.hasOwnProperty("test") || !options.test ) {
-            addDailyLikedPost(postsMetadata[i], isFirst);
-            isFirst = false;
+            thresholdInfo.total = threshold;
+            if (thresholdInfo.total < configVars.MIN_SCORE_THRESHOLD) {
+              thresholdInfo.total = configVars.MIN_SCORE_THRESHOLD;
+            }
           }
-        } else {
+          avgWindowInfo.scoreThreshold = thresholdInfo.total;
+          postsMetadata[i].thresholdInfo = thresholdInfo;
+          persistentLog(LOG_VERBOSE, " - - - new avg / score threshold: " + avgWindowInfo.scoreThreshold);
+          persistentLog(LOG_VERBOSE, " - - - - new threshold info: " + JSON.stringify(thresholdInfo));
+          // prune scores in window list to keep at NUM_POSTS_FOR_AVG_WINDOW size
+          if ((avgWindowInfo.postScores.length - configVars.NUM_POSTS_FOR_AVG_WINDOW) >= 0) {
+            var newScoresWindow = [];
+            for (var j = avgWindowInfo.postScores.length - configVars.NUM_POSTS_FOR_AVG_WINDOW; j < avgWindowInfo.postScores.length; j++) {
+              newScoresWindow.push(avgWindowInfo.postScores[j]);
+            }
+            avgWindowInfo.postScores = newScoresWindow;
+          }
+
+          // check if post score is above threshold, set to vote if is
           postsMetadata[i].vote = false;
-          persistentLog(LOG_VERBOSE, " - - "+postsMetadata[i].score+" < "+avgWindowInfo.scoreThreshold+", WILL NOT vote on post ["+posts[i].permlink+"]");
-        }
+          if (postsMetadata[i].score >= avgWindowInfo.scoreThreshold) {
+            // #7 first check if we have voting power
+            var percentageVp = owner.voting_power / 100;
+            persistentLog(LOG_VERBOSE, " - - - checking if enough" +
+              " voting power" +
+              " (" + percentageVp + " >= " + configVars.MIN_VOTING_POWER + ") ?");
+            if (percentageVp >= configVars.MIN_VOTING_POWER) {
+              // housekeeping
+              persistentLog(LOG_VERBOSE, " - - " + postsMetadata[i].score + " >= " + avgWindowInfo.scoreThreshold + ", WILL vote on post [" + posts[i].permlink + "]");
+              postsMetadata[i].vote = true;
+              upVotesProcessed++;
+              addDailyLikedPost(postsMetadata[i], isFirst);
+              isFirst = false;
+              // #7 now voting here
+              if (options == null || !options.hasOwnProperty("test") || !options.test) {
+                // vote!
+                try {
+                  var upvoteResult = wait.for(steem.broadcast.vote, process.env.POSTING_KEY_PRV,
+                    process.env.STEEM_USER, postsMetadata[i].author,
+                    postsMetadata[i].permlink, parseInt(configVars.VOTE_VOTING_POWER * 100));
+                  persistentLog(LOG_GENERAL, " - - - - upvoted with result: " + JSON.stringify(upvoteResult));
+                } catch (err) {
+                  persistentLog(LOG_GENERAL, " - - - - ERROR voting on post: " + postsMetadata[i].permlink);
+                }
+                persistentLog(LOG_GENERAL, " - - - - voted on " + upVotesProcessed + " posts");
+                // wait 5 seconds
+                persistentLog(LOG_GENERAL, " - - - waiting 3 seconds...");
+                var timeOutWrapper = function (delay, func) {
+                  setTimeout(function () {
+                    func(null, true);
+                  }, delay);
+                };
+                wait.for(timeOutWrapper, 5000);
+                persistentLog(LOG_VERBOSE, " - - - finished waiting for vote");
+                // comment on post if enabled and comment text exists
+                if (configVars.COMMENT_ENABLED !== undefined && configVars.COMMENT_ENABLED !== null &&
+                    configVars.COMMENT_ENABLED.localeCompare('on') === 0 &&
+                    algorithm.comment !== undefined && algorithm.comment !== null &&
+                    algorithm.comment.length > 0) {
+                  console.log(' - - - commenting on post: ' + algorithm.comment);
+                  var commentPermlink = steem.formatter.commentPermlink(postsMetadata[i].author, postsMetadata[i].permlink)
+                    .toLowerCase()
+                    .replace('.', '');
+                  if (commentPermlink.length >= 256) {
+                    commentPermlink = steem.formatter.commentPermlink(postsMetadata[i].author, postsMetadata[i].author + '-' + process.env.STEEM_USER)
+                      .toLowerCase()
+                      .replace('.', '');
+                  }
+                  try {
+                    var commentResult = wait.for(steem.broadcast.comment,
+                      process.env.POSTING_KEY_PRV,
+                      postsMetadata[i].author,
+                      postsMetadata[i].permlink,
+                      process.env.STEEM_USER,
+                      commentPermlink,
+                      'fossbot voter comment',
+                      algorithm.comment,
+                      {});
+                    console.log(' - - - - comment result: ' + JSON.stringify(commentResult));
+                  } catch (err) {
+                    console.log(' - - - - comment posting error');
+                    console.error(err);
+                  }
+                  console.log(' - - - - - Waiting for comment timeout...');
+                  wait.for(timeOutWrapper, 20000);
+                  console.log(' - - - - - finished waiting');
+                } else {
+                  // alert user why not commenting if in verbose logging mode
+                  persistentLog(LOG_VERBOSE, " - - - not commenting, because config var COMMENT_ENABLED is '" + configVars.COMMENT_ENABLED + "' and comment in algorithm is '" + algorithm.comment + "'");
+                }
+              } else {
+                persistentLog(LOG_VERBOSE, " - - - would have voted, but running in test mode");
+              }
+              // update accounts _after_ attempting vote
+              var account = wait.for(steem_getAccounts_wrapper)[0];
+              // don't do regeneration, will be up to date
+              owner.voting_power = account.voting_power;
+              persistentLog(LOG_VERBOSE, " - - - update voting power to "+owner.voting_power);
+            } else {
+              persistentLog(LOG_GENERAL, " - - - - NOT voting on " + postsMetadata[i].permlink + ", VP is " + percentageVp);
+            }
+          } else {
+            persistentLog(LOG_VERBOSE, " - - " + postsMetadata[i].score + " < " + avgWindowInfo.scoreThreshold + ", WILL NOT vote on post [" + posts[i].permlink + "]");
+          }
 
-      }
-      // restore avgWindowInfo
-      if (options != null && options.test) {
-        avgWindowInfo = avgWindowInfo_copy;
-      }
-      // save updated avgWindowInfo
-      persistentLog(LOG_VERBOSE, " - saving avg_window_info");
-      persistJson("avg_window_info", avgWindowInfo, function(err) {
-        if (err) {
-          persistentLog(LOG_GENERAL, " - - ERROR SAVING avg_window_info");
         }
+        // restore avgWindowInfo
+        if (options != null && options.test) {
+          avgWindowInfo = avgWindowInfo_copy;
+        }
+        // save updated avgWindowInfo
+        persistentLog(LOG_VERBOSE, " - saving avg_window_info");
+        persistObj(DB_AVG_WINDOW_INFO, avgWindowInfo, function (err) {
+          if (err) {
+            persistentLog(LOG_GENERAL, " - - ERROR SAVING avg_window_info");
+          }
+        });
+        // finish
+        deferred.resolve(true);
       });
-      // finish
-      deferred.resolve(true);
       return deferred.promise;
     },
-    // return http before casting votes
+    // return http after casting votes
     function () {
-      persistentLog(LOG_GENERAL, "return http before casting votes...");
+      persistentLog(LOG_GENERAL, "save posts metadata to db...");
       var deferred = Q.defer();
-      // #53, call callback when everything complete if local run, i.e. not called from web app directly
-      if (options !== undefined && options.hasOwnProperty("local") && options.local) {
-        // don't call back
-      } else if (callback) {
-        // finally, send good http response back
-        // back to http if not called locally
-        callback(
-          {
-            status: 200, 
-            message: "Scores calculated, votes will now be cast. Check log and / or email for full log and result.",
-            posts: postsMetadata
-          });
-      }
       // and save postsMetadata to persistent
       if (options === undefined || !options.hasOwnProperty("test") || !options.test ) {
         persistentLog(LOG_VERBOSE, " - saving posts_metadata");
-        savePostsMetadata({postsMetadata: postsMetadata}, function (res) {
-          persistentLog(LOG_VERBOSE, " - - SAVING posts_metadata: " + res.message);
+        savePostsMetadata(function (res) {
+          persistentLog(LOG_VERBOSE, " - - SAVED posts_metadata: " + res.message);
           // finish
           deferred.resolve(true);
         });
       } else {
         persistentLog(LOG_GENERAL, " - - NOT saving postsmetadata, this is a test run");
         // finish
-        deferred.resolve(true);
-      }
-      return deferred.promise;
-    },
-    // cast votes to steem
-    function () {
-      persistentLog(LOG_GENERAL, "cast votes to steem...");
-      var deferred = Q.defer();
-      var count = 0;
-      // cast vote
-      persistentLog(LOG_VERBOSE, " - voting");
-      if (postsMetadata.length > 0) {
-        wait.launchFiber(function() {
-          var numToVoteOn = 0;
-          for (var i = 0 ; i < postsMetadata.length ; i++) {
-            var doVote = true;
-            if (options !== undefined && options.test) {
-              doVote = false;
-            }
-            if (doVote) {
-              if (postsMetadata[i].vote) {
-                numToVoteOn++;
-              }
-            }
-          }
-          persistentLog(LOG_GENERAL, " - num posts to vote on: "+numToVoteOn);
-          numVoteOn = numToVoteOn;
-          var numVotedOn = 0;
-          for (var i = 0 ; i < postsMetadata.length ; i++) {
-            persistentLog(LOG_VERBOSE, " - - - "+(postsMetadata[i].vote ? "YES" : "NO")+" vote on post, score: "
-                +postsMetadata[i].score+", permlink: "+postsMetadata[i].permlink);
-            var doVote = true;
-            if (options !== undefined && options.test) {
-              doVote = false;
-            }
-            if (doVote) {
-              if (postsMetadata[i].vote) {
-                // vote!
-                try {
-                  var upvoteResult = wait.for(steem.broadcast.vote, process.env.POSTING_KEY_PRV,
-                        process.env.STEEM_USER, postsMetadata[i].author,
-                        postsMetadata[i].permlink, 10000);
-                  persistentLog(LOG_GENERAL, " - - - - upvoted with result: "+JSON.stringify(upvoteResult));
-                } catch (err) {
-                  persistentLog(LOG_GENERAL, " - - - - ERROR voting on post: "+postsMetadata[i].permlink);
-                }
-                numVotedOn++;
-                persistentLog(LOG_GENERAL, " - - - - voted on vote " + numVotedOn + " of "+numToVoteOn);
-                // wait 5 seconds
-                persistentLog(LOG_GENERAL, " - - - waiting 3 seconds...");
-                var timeOutWrapper = function (delay, func) {
-                  setTimeout(function() {
-                    func(null, true);
-                  }, delay);
-                }
-                var timeOutResult = wait.for(timeOutWrapper, 5000);
-                persistentLog(LOG_VERBOSE, " - - - finished waiting");
-              } else {
-                persistentLog(LOG_VERBOSE, " - - - - not voting on post: "+postsMetadata[i].permlink);
-              }
-            } else {
-              persistentLog(LOG_VERBOSE, " - - - - TEST, not voting on post: "+postsMetadata[i].permlink);
-            }
-          }
-          persistentLog(LOG_GENERAL, " - finished voting");
-          deferred.resolve(true);
-        });
-      } else {
-        persistentLog(LOG_GENERAL, " - - no post to vote on");
         deferred.resolve(true);
       }
       return deferred.promise;
@@ -1332,41 +1356,30 @@ function runBot(callback, options) {
   .then(function(response) {
     if (response) {
       persistentLog(LOG_GENERAL, "runBot finished successfully!");
-      // send email
-      sendRunEmail(options, function () {
-        // #53, call callback when everything complete if local run, i.e. not called from web app directly
-        if (callback && options !== undefined && options.hasOwnProperty("local") && options.local) {
-          // #53, additionally, give 10 seconds to complete in case there are loose anonymous processes to finish
-          setTimeout(function () {
-            persistentLog(LOG_GENERAL, "Finally let process know to quit if local");
-            callback(
-              {
-                status: 200,
-                message: "Scores calculated, and votes cast for local run.",
-                posts: postsMetadata
-              });
-          }, 10000);
-        }
-      });
+      if (callback !== undefined && callback !== null) {
+        setTimeout(function () {
+          callback(postsMetadata);
+        }, 10000);
+      }
     }
   })
   .catch(function (err) {
-    setError("stopped", false, err.message);
-    sendRunEmail(options, function () {
-      // #53, call callback when everything complete if local run, i.e. not called from web app directly
-      if (callback && options !== undefined && options.hasOwnProperty("local") && options.local) {
-        // #53, additionally, give 10 seconds to complete in case there are loose anonymous processes to finish
-        setTimeout(function () {
-          persistentLog(LOG_GENERAL, "Finally let process know to quit if local");
-          callback(
-            {
-              status: 200,
-              message: "Finished with error",
-              posts: postsMetadata
-            });
-        }, 10000);
-      }
-    });
+    console.error(err);
+    if (callback !== undefined && callback !== null) {
+      setTimeout(function () {
+        callback(postsMetadata);
+      }, 10000);
+    }
+  });
+}
+
+function steem_getAccounts_wrapper(callback) {
+  var called = false;
+  steem.api.getAccounts([process.env.STEEM_USER], function (err, result) {
+    if (!called) {
+      called = true;
+      callback(err, result);
+    }
   });
 }
 
@@ -1400,288 +1413,93 @@ function addDailyLikedPost(postsMetadataObj, isFirst) {
   var nowDate = moment_tz.tz((new Date()).getTime(), configVars.TIME_ZONE);
   var dateStr = nowDate.format("MM-DD-YYYY");
   var createNew = true;
-  if (dailyLikedPosts.length > 0) {
-    // clean old posts
-    var limitDate = nowDate.clone();
-    limitDate.subtract(configVars.DAYS_KEEP_LOGS, 'days');
-    var dailyLikedPosts_keep = [];
-    for (var i = 0 ; i < dailyLikedPosts.length ; i++) {
-      var date = moment(dailyLikedPosts[i].date_str, "MM-DD-YYYY");
-      if (!date.isBefore(limitDate)) {
-        dailyLikedPosts_keep.push(dailyLikedPosts[i]);
-      }
-    }
-    persistentLog(LOG_VERBOSE, " - removing "+(dailyLikedPosts.length - dailyLikedPosts_keep.length)+" old dailyLikedPosts entries, too old");
-    dailyLikedPosts = dailyLikedPosts_keep;
-    // try to find match to add this daily voted post to
-    for (var i = 0 ; i < dailyLikedPosts.length ; i++) {
-      if (dailyLikedPosts[i].date_str.localeCompare(dateStr) == 0) {
-        dailyLikedPosts[i].posts.push(postsMetadataObj);
-        if (isFirst) {
-          dailyLikedPosts[i].runs = dailyLikedPosts[i].runs + 1;
+  db.collection(DB_DAILY_LIKED_POSTS).find({}).toArray(function(err, dailyLikedPosts) {
+    if (err || dailyLikedPosts === null && dailyLikedPosts.length === 0 || dailyLikedPosts[0] === null) {
+      persistentLog(LOG_GENERAL, " - failed to save daily liked post");
+    } else {
+      // clean old posts
+      var limitDate = nowDate.clone();
+      limitDate.subtract(configVars.DAYS_KEEP_LOGS, 'days');
+      var numRemoved = 0;
+      for (var i = 0 ; i < dailyLikedPosts.length ; i++) {
+        var date = moment(dailyLikedPosts[i].date_str, "MM-DD-YYYY");
+        if (date.isBefore(limitDate)) {
+          // remove
+          db.collection(DB_DAILY_LIKED_POSTS).remove(dailyLikedPosts[i], function (err, data) {
+            if (err) {
+              persistentLog(LOG_GENERAL, " - - failed to remove old" +
+                " daily liked post");
+            }
+          });
+          numRemoved++;
         }
-        persistentLog(LOG_VERBOSE, " - match on existing date: "+dateStr+", adding to that");
-        createNew = false;
-        break;
       }
-    }
-  }
-  if (createNew) {
-    // add new date object with this post
-    dailyLikedPosts.push({
-      date_str: dateStr,
-      posts: [
-        postsMetadataObj
-      ],
-      runs: 1
-    });
-    persistentLog(LOG_VERBOSE, " - creating new date: "+dateStr);
-  }
-  // save
-  persistentLog(LOG_VERBOSE, " - saving updated dailyLikedPosts object");
-  persistJson("daily_liked_posts", {data: dailyLikedPosts}, function(err) {
-    if (err) {
-      persistentLog(LOG_GENERAL, "ERROR, addDailyLikedPost failed to be saved");
-    }
-  })
-}
-
-function sendRunEmail(options, callback) {
-  persistentLog(LOG_GENERAL, "check how to send email...");
-  if ((options && options.test) || configVars.EMAIL_DIGEST == 0) {
-    sendRunEmailNow(options, callback);
-    return;
-  } else {
-    if (dailyLikedPosts.length < 1) {
-      // do nothing, nothing saved
-      persistentLog(LOG_GENERAL, " - can't send digest email, nothing saved");
-      if (callback !== undefined) {
-        callback();
-      }
-      return
-    }
-    // check if first post of new day is made, the send digest of previous day
-    var nowDate = moment_tz.tz((new Date()).getTime(), configVars.TIME_ZONE);
-    persistentLog(LOG_VERBOSE, " - checking if latest bot run is of new day, if so then email digest of previous day");
-    for (var i = 0 ; i < dailyLikedPosts.length ; i++) {
-      persistentLog(LOG_VERBOSE, " - - checking date: "+dailyLikedPosts[i].date_str);
-      if (nowDate.format("MM-DD-YYYY").localeCompare(dailyLikedPosts[i].date_str) == 0) {
-        persistentLog(LOG_VERBOSE, " - - found today, number of runs: "+dailyLikedPosts[i].runs);
-        if (dailyLikedPosts[i].runs <= 1) {
-          //send digest of previous date
-          nowDate.subtract(1, 'day');
-          persistentLog(LOG_VERBOSE, " - - last run today was first run so sending digest email of date "+nowDate.format("MM-DD-YYYY")+", if exists");
-          sendRunEmailDigest(nowDate.format("MM-DD-YYYY"), options, callback);
-          return;
+      persistentLog(LOG_VERBOSE, " - removed "+numRemoved+" old daily" +
+        " liked posts");
+      // try to find match to add this daily voted post to
+      for (var i = 0 ; i < dailyLikedPosts.length ; i++) {
+        if (dailyLikedPosts[i].date_str.localeCompare(dateStr) === 0) {
+          dailyLikedPosts[i].posts.push(postsMetadataObj);
+          if (isFirst) {
+            dailyLikedPosts[i].runs = dailyLikedPosts[i].runs + 1;
+          }
+          persistentLog(LOG_VERBOSE, " - match on existing date: "+dateStr+", adding to that");
+          createNew = false;
+          db.collection(DB_DAILY_LIKED_POSTS).save(dailyLikedPosts[i], function (err, data) {
+            if (err) {
+              persistentLog(LOG_GENERAL, " - - error saving daily liked" +
+                " post");
+            } else {
+              persistentLog(LOG_VERBOSE, " - - saved daily liked post");
+            }
+          });
+          break;
         }
-        // else
-        persistentLog(LOG_GENERAL, " - more than one run today, wait until tomorrow to publish digest for today");
-        if (callback !== undefined) {
-          callback();
-        }
-        return;
+      }
+      if (createNew) {
+        // add new date object with this post
+        persistentLog(LOG_VERBOSE, " - creating new date: "+dateStr);
+        db.collection(DB_DAILY_LIKED_POSTS).save(
+          {
+            date_str: dateStr,
+            posts: [
+              postsMetadataObj
+            ],
+            runs: 1
+          },
+          function (err, data) {
+            if (err) {
+              persistentLog(LOG_GENERAL, " - - error saving new daily" +
+                " liked post");
+            } else {
+              persistentLog(LOG_VERBOSE, " - - saved new daily liked post");
+            }
+        });
       }
     }
-    persistentLog(LOG_GENERAL, " - didn't find match for today, this signifies an ERROR");
-  }
-  if (callback !== undefined) {
-    callback();
-  }
-}
-
-function sendRunEmailNow(options, callback) {
-  persistentLog(LOG_GENERAL, "send email now...");
-  var email = "<html><body><h1>Aggiornamento: VoterBot ha completato con successo .</h1>";
-  email += "<h3>at "+moment_tz.tz((new Date()).getTime(), configVars.TIME_ZONE).format("MMM Do YYYY HH:mm")+"</h3>";
-  //algorithmSet
-  if (!algorithmSet) {
-    email += "<h3>Note, using default algorithm, no algorithm set! See below for details</h3>";
-  }
-  if (options && options.test) {
-    email += "<h3>TEST RUN - no votes will be cast</h3>";
-  }
-  email += "<h2>User stats</h2>";
-  email += "<p>User: "+process.env.STEEM_USER+"</p>";
-  var votingPower = (owner.voting_power > 0 ? owner.voting_power / 100 : 0).toFixed(2);
-  email += "<p>Voting power: "+votingPower+"</p>";
-  email += "<h2>Posts and scores:</h2>";
-  if (postsMetadata.length > 0) {
-    // first sort postsMetadata
-    var maxScore = Number.MAX_VALUE;
-    var sortedPostsMetadata = postsMetadata.sort(function(a, b) {
-      return b.score - a.score;
-    });
-    // add to email
-    for (var i = 0 ; i < sortedPostsMetadata.length ; i++) {
-      email += "<p><span style=\"color: "+(sortedPostsMetadata[i].vote ? "green" : "red")+";\">"
-        +"Score <strong>"+sortedPostsMetadata[i].score.toFixed(2)+"</strong> "
-        +"| <a href=\""+sortedPostsMetadata[i].url+"\"><strong>"+sortedPostsMetadata[i].title+"</strong></a> "
-        +"| author: "+sortedPostsMetadata[i].author + " "
-        +"| cur est $"+sortedPostsMetadata[i].cur_est_payout.toFixed(3)+" "
-        +"| upvotes: "+sortedPostsMetadata[i].upvotes+" "
-        +"| downvotes: "+sortedPostsMetadata[i].downvotes+" "
-        +"| age when scored: "+sortedPostsMetadata[i].alive_time.toFixed(2)+" mins "
-        +"</span></p>";
-    }
-  } else {
-    email += "<p><span style=\"color: red;\"><strong>No new posts found</strong></span></p>";
-  }
-  email += "</hr>"
-  email += "<h2>User weights and config:</h2>";
-  email += "<h3>Weights</h3>";
-  if (algorithm.weights.length > 0) {
-    for (var i = 0 ; i < algorithm.weights.length ; i++) {
-      email += "<p>Key: <strong>"+algorithm.weights[i].key+"</strong>, value: <strong>"
-        +algorithm.weights[i].value+"</strong>";
-      if (algorithm.weights[i].hasOwnProperty("lower")) {
-        email += ", lower bound: "+algorithm.weights[i].lower;
-      }
-      if (algorithm.weights[i].hasOwnProperty("upper")) {
-        email += ", upper bound: "+algorithm.weights[i].upper;
-      }
-      email += "</p>";
-    }
-  } else {
-    email += "<p><span style=\"color: red;\">No weights! Please set in algorithm</span></p>";
-  }
-  //var weightsHtml = JSON.stringify(algorithm.weights, null, 4);
-  //email += "<p>"+weightsHtml+"</p>";
-  //email += "<h3>White and black lists</h3>";
-  //email += "<p>Author whitelist: "+JSON.stringify(algorithm.authorWhitelist)+"</p>";
-  //email += "<p>Author blacklist: "+JSON.stringify(algorithm.authorBlacklist)+"</p>";
-  //email += "<p>Content category whitelist: "+JSON.stringify(algorithm.contentCategoryWhitelist)+"</p>";
-  //email += "<p>Content category blacklist: "+JSON.stringify(algorithm.contentCategoryBlacklist)+"</p>";
-  //email += "<p>Content word whitelist: "+JSON.stringify(algorithm.contentWordWhitelist)+"</p>";
-  //email += "<p>Content word blacklist: "+JSON.stringify(algorithm.contentWordBlacklist)+"</p>";
-  //email += "<p>Domain whitelist: "+JSON.stringify(algorithm.domainWhitelist)+"</p>";
-  //email += "<p>Domain blacklist: "+JSON.stringify(algorithm.domainBlacklist)+"</p>";
-  //email += "<h3>Averaging window</h3>";
-  //email += "<p>Averaging window size (in posts): "+configVars.NUM_POSTS_FOR_AVG_WINDOW+"</p>";
-  //email += "<p>Current score threshold: "+avgWindowInfo.scoreThreshold+"</p>";
-  //email += "<p>Percentage add to threshold: "+(configVars.SCORE_THRESHOLD_INC_PC*100)+"%</p>";
-  //email += "<p>Number of votes today: "+owner.num_votes_today+" + "+numVoteOn+" now = "+(owner.num_votes_today+numVoteOn)+"</p>";
-  //email += "<p>Added to threshold to adjust for todays votes: "+avgWindowInfo.lastThresholdUpAdjust+"</p>";
-  //email += "<h3>Misc constant settings</h3>";
-  //email += "<p>Max posts to get: "+configVars.MAX_POST_TO_READ+"</p>";
-  //email += "<p>Dolpin min SP: "+configVars.CAPITAL_DOLPHIN_MIN+"</p>";
-  //email += "<p>Whale min SP: "+configVars.CAPITAL_WHALE_MIN+"</p>";
-  //email += "<p>Key detector, min keyword length: "+configVars.MIN_KEYWORD_LEN+"</p>";
-  //email += "<h2>Raw results metadata:</h2>";
-  //var metadataHtml = JSON.stringify(postsMetadata, null, 4);
-  //email += "<p>"+metadataHtml+"</p>";
-  //email += "<h3>Process logs:</h3>";
-  //email += "<p>"+logHtml+"</p>";
-  //email += "</body></html>";
-  sendEmail("Voter bot", email, true, function () {
-    persistString("last_log_html", email, function(err) {
-      if (err) {
-        persistentLog(LOG_GENERAL, "couldn't save last log html as persistent string");
-      }
-      if (callback !== undefined) {
-        callback();
-      }
-    });
   });
 }
 
-function sendRunEmailDigest(dateStr, options, callback) {
-  persistentLog(LOG_GENERAL, "send digest email for "+dateStr+"...");
-  var posts = null;
-  for (var i = 0 ; i < dailyLikedPosts.length ; i++) {
-    if (dailyLikedPosts[i].date_str.localeCompare(dateStr) == 0) {
-      posts = dailyLikedPosts[i].posts;
-      break;
-    }
+function getDailyLikedPosts(date_str, callback) {
+  persistentLog(LOG_VERBOSE, " - getDailyLikedPosts, for date_str = "+date_str);
+  var query = {};
+  if (date_str !== undefined && date_str !== null) {
+    query = {"date_str": date_str};
   }
-  if (posts == null) {
-    persistentLog(LOG_GENERAL, " - can't send digest, can't find date in list: "+dateStr);
-    if (callback !== undefined) {
-      callback();
-    }
-    return;
-  }
-  var email = "<html><body><h1>Daily digest for Voter bot</h1>";
-  email += "<h3>at "+moment_tz.tz((new Date()).getTime(), configVars.TIME_ZONE).format("MMM Do YYYY HH:mm")+"</h3>";
-  //algorithmSet
-  if (!algorithmSet) {
-    email += "<h3>Note, using default algorithm, no algorithm set! See below for details</h3>";
-  }
-  if (options && options.test) {
-    email += "<h3>TEST RUN - no votes will be cast</h3>";
-  }
-  email += "<h2>User stats</h2>";
-  email += "<p>User: "+process.env.STEEM_USER+"</p>";
-  var votingPower = (owner.voting_power > 0 ? owner.voting_power / 100 : 0).toFixed(2);
-  email += "<p>Voting power: "+votingPower+"</p>";
-  email += "<h2>Posts and scores:</h2>";
-  if (posts.length > 0) {
-    // add to email
-    for (var i = 0 ; i < posts.length ; i++) {
-      email += "<p><span style=\"color: "+(posts[i].vote ? "green" : "red")+";\">"
-        +"Score <strong>"+posts[i].score.toFixed(2)+"</strong> "
-        +"| <a href=\""+posts[i].url+"\"><strong>"+posts[i].title+"</strong></a> "
-        +"| author: "+posts[i].author + " "
-        +"| cur est $"+posts[i].cur_est_payout.toFixed(3)+" "
-        +"| upvotes: "+posts[i].upvotes+" "
-        +"| downvotes: "+posts[i].downvotes+" "
-        +"| age when scored: "+posts[i].alive_time.toFixed(2)+" mins "
-        +"</span></p>";
-    }
-  } else {
-    email += "<p><span style=\"color: red;\"><strong>No new posts found</strong></span></p>";
-  }
-  email += "</hr>"
-  email += "<h2>User weights and config:</h2>";
-  email += "<h3>Weights</h3>";
-  if (algorithm.weights.length > 0) {
-    for (var i = 0 ; i < algorithm.weights.length ; i++) {
-      email += "<p>Key: <strong>"+algorithm.weights[i].key+"</strong>, value: <strong>"
-        +algorithm.weights[i].value+"</strong>";
-      if (algorithm.weights[i].hasOwnProperty("lower")) {
-        email += ", lower bound: "+algorithm.weights[i].lower;
+  db.collection(DB_DAILY_LIKED_POSTS).find(query).toArray(function(err, data) {
+    if (err || data === undefined || data === null || data.length === 0 || data[0] === undefined || data[0] === null) {
+      persistentLog(LOG_GENERAL, " - failed to get daily liked post");
+      callback(err);
+    } else {
+      if (date_str !== undefined && date_str !== null) {
+        callback(null, data[0]);
+      } else {
+        callback(null, data);
       }
-      if (algorithm.weights[i].hasOwnProperty("upper")) {
-        email += ", upper bound: "+algorithm.weights[i].upper;
-      }
-      email += "</p>";
     }
-  } else {
-    email += "<p><span style=\"color: red;\">No weights! Please set in algorithm</span></p>";
-  }
-  //var weightsHtml = JSON.stringify(algorithm.weights, null, 4);
-  //email += "<p>"+weightsHtml+"</p>";
-  email += "<h3>White and black lists</h3>";
-  email += "<p>Author whitelist: "+JSON.stringify(algorithm.authorWhitelist)+"</p>";
-  email += "<p>Author blacklist: "+JSON.stringify(algorithm.authorBlacklist)+"</p>";
-  email += "<p>Content category whitelist: "+JSON.stringify(algorithm.contentCategoryWhitelist)+"</p>";
-  email += "<p>Content category blacklist: "+JSON.stringify(algorithm.contentCategoryBlacklist)+"</p>";
-  email += "<p>Content word whitelist: "+JSON.stringify(algorithm.contentWordWhitelist)+"</p>";
-  email += "<p>Content word blacklist: "+JSON.stringify(algorithm.contentWordBlacklist)+"</p>";
-  email += "<p>Domain whitelist: "+JSON.stringify(algorithm.domainWhitelist)+"</p>";
-  email += "<p>Domain blacklist: "+JSON.stringify(algorithm.domainBlacklist)+"</p>";
-  email += "<h3>Averaging window</h3>";
-  email += "<p>Averaging window size (in posts): "+configVars.NUM_POSTS_FOR_AVG_WINDOW+"</p>";
-  email += "<p>Current score threshold: "+avgWindowInfo.scoreThreshold+"</p>";
-  email += "<p>Percentage add to threshold: "+(configVars.SCORE_THRESHOLD_INC_PC*100)+"%</p>";
-  email += "<p>Number of votes today: "+owner.num_votes_today+" + "+numVoteOn+" now = "+(owner.num_votes_today+numVoteOn)+"</p>";
-  //email += "<p>Added to threshold to adjust for todays votes: "+avgWindowInfo.lastThresholdUpAdjust+"</p>";
-  email += "<h3>Misc constant settings</h3>";
-  email += "<p>Max posts to get: "+configVars.MAX_POST_TO_READ+"</p>";
-  email += "<p>Dolpin min SP: "+configVars.CAPITAL_DOLPHIN_MIN+"</p>";
-  email += "<p>Whale min SP: "+configVars.CAPITAL_WHALE_MIN+"</p>";
-  email += "<p>Key detector, min keyword length: "+configVars.MIN_KEYWORD_LEN+"</p>";
-  email += "</body></html>";
-  sendEmail("Voter bot", email, true, function () {
-    persistString("last_log_html", email, function(err) {
-      if (err) {
-        persistentLog(LOG_GENERAL, "couldn't save last log html as persistent string");
-      }
-      if (callback !== undefined) {
-        callback();
-      }
-    });
   });
 }
+
 
 /*
 * Steem access
@@ -1691,10 +1509,23 @@ function sendRunEmailDigest(dateStr, options, callback) {
 initSteem():
 * Initialize steem, test API connection and get minimal required data
 */
-function initSteem(callback) {
-  // #50, fix Websocket address, server has migrated to new URL
-  steem.api.setWebSocket('wss://steemd.steemit.com');
+function initLib(initSteem, callback) {
+  setupLogging();
+  // #93, use alternate websocket temporarily
+  steem.api.setOptions({ url: 'https://api.steemit.com'});
+  // #71, no longer need to set this
   var processes = [
+    function() {
+      var deferred = Q.defer();
+      startDb(function(err) {
+        if (err) {
+          throw err;
+        } else {
+          deferred.resolve(true);
+        }
+      });
+      return deferred.promise;
+    },
     function() {
       var deferred = Q.defer();
       testEnvVars(function(err) {
@@ -1708,24 +1539,28 @@ function initSteem(callback) {
     },
     function() {
       var deferred = Q.defer();
-      getUserAccount(function(err) {
-        if (err) {
-          throw err;
-        } else {
-          deferred.resolve(true);
-        }
-      });
+      if (initSteem) {
+        getUserAccount(function(err) {
+          if (err) {
+            throw err;
+          } else {
+            deferred.resolve(true);
+          }
+        });
+      } else {
+        deferred.resolve(true);
+      }
       return deferred.promise;
     },
     function() {
       var deferred = Q.defer();
       // get last post
-      getPersistentJson("lastpost", function(err, post) {
+      getPersistentObj(DB_LAST_POST, function(err, post) {
         if (err) {
           console.log("no last post, probably this is first run for server");
           throw err;
         } else {
-          if (lastPost !== undefined && lastPost !== null) {
+          if (post !== undefined && post !== null) {
             lastPost = post;
             console.log("got last post, id: "+lastPost.id);
           } else {
@@ -1738,19 +1573,14 @@ function initSteem(callback) {
     },
     function() {
       var deferred = Q.defer();
-      getPersistentJson("config_vars", function(err, configVarsResult) {
-        if (configVarsResult !== null) {
-          updateConfigVars(configVarsResult, function(err) {
-            if (err) {
-              throw err;
-            } else {
-              deferred.resolve(true);
-            }
-          });
+      getPersistentObj(DB_CONFIG_VARS, function(err, configVarsResult) {
+        if (err || configVarsResult === undefined || configVarsResult === null) {
+          console.log("no config vars set yet, using default");
         } else {
-          // use default, already set
-          deferred.resolve(true);
+          console.log("got config vars from db");
+          configVars = configVarsResult;
         }
+        deferred.resolve(true);
       });
       return deferred.promise;
     }
@@ -1771,7 +1601,7 @@ function initSteem(callback) {
       }
     })
     .catch(function (err) {
-      setError("stopped", false, err.message);
+      console.error(err);
       callback(false);
     });
 }
@@ -1780,55 +1610,108 @@ function initSteem(callback) {
 getUserAccount():
 */
 function getUserAccount(callback) {
-  if (showFatalError()) {
-    callback({message: "Fatal error in getUserAccount"});
-    return;
-  }
   if (process.env.STEEM_USER) {
     steem.api.getAccounts([process.env.STEEM_USER], function(err, result) {
       console.log(err, result);
       if (err || result.length < 1) {
-        setError("init_error", true, "Could not fetch STEEM_USER"+(err ? ": "+err.message : ""));
+        console.error(err);
         callback({message: "Fatal error in getUserAccount"});
       } else {
         // check if user can vote, if not this app is useless
         if (!result[0].can_vote) {
-          setError("init_error", true, "User "+process.env.STEEM_USER+"cannot vote!");
+          console.error("User "+process.env.STEEM_USER+"cannot vote!");
           callback({message: "Fatal error in getUserAccount"});
           return;
         }
         // save some values about this user in owner object
         owner.voting_power = result[0].voting_power;
+        owner.last_vote_time = result[0].last_vote_time;
         owner.last_post_time = (new Date() - getEpochMillis(result[0].last_root_post)) / 60000; // convert ms to mins
         steem.api.getDynamicGlobalProperties(function(err, properties) {
           //console.log(err, properties);
           if (err) {
-            setError("init_error", false, "Can't get DynamicGlobalProperties, can't calculate user's Steem Power");
+            console.error("Can't get DynamicGlobalProperties, can't calculate user's Steem Power");
+            console.error(err);
             callback({message: "Fatal error in getUserAccount"});
           } else {
             steemGlobalProperties = properties;
             owner.steem_power = getSteemPowerFromVest(result[0].vesting_shares);
           }
-          // get followers
-          getFollowers_recursive(process.env.STEEM_USER, null, function(err, followersResult) {
-            console.log("getFollowing");
-            following = [];
-            if (err || followersResult === undefined) {
-              setError("init_error", false, "Can't get following accounts");
-              callback({message: "Fatal error in getUserAccount"});
+          // get latest blocktime
+          steem.api.getBlockHeader(properties.head_block_number, function(err, headBlock) {
+            //callback(err, result);
+            if (err) {
+              console.error("Can't get head block info");
+              console.error(err);
+              callback({message: "Fatal error in getBlockHeader"});
             } else {
-              following = followersResult;
+              owner.latest_block_time = moment(headBlock.timestamp, moment.ISO_8601);
+              console.log("latest block time: "+owner.latest_block_time.toISOString());
+              // adjust voting power
+              var lastVoteTime = moment(owner.last_vote_time);
+              var secondsDiff = (owner.latest_block_time.valueOf() - lastVoteTime.valueOf()) / 1000;
+              if (secondsDiff > 0) {
+                var vpRegenerated = secondsDiff * 10000 / 86400 / 5;
+                owner.voting_power += vpRegenerated;
+              }
+              if (owner.voting_power > 10000) {
+                owner.voting_power = 10000;
+              }
+              console.log(" - - new vp(corrected): "+owner.voting_power);
+              // get followers
+              getFollowers_recursive(process.env.STEEM_USER, null, function(err, followersResult) {
+                console.log("getFollowing");
+                following = [];
+                if (err || followersResult === undefined) {
+                  console.error("Can't get following accounts");
+                  console.error(err);
+                  callback({message: "Fatal error in getFollowers_recursive"});
+                } else {
+                  following = followersResult;
+                }
+                console.log(""+process.env.STEEM_USER+" follows: "+following);
+                // final callback without error, all functions completed
+                callback();
+              });
+              // log owner object
+              console.log("owner: "+JSON.stringify(owner));
             }
-            console.log(""+process.env.STEEM_USER+" follows: "+following);
-            // final callback without error, all functions completed
-            callback();
           });
-          // log owner object
-          console.log("owner: "+JSON.stringify(owner));
         });
       }
     });
+  } else {
+    console.error("No STEEM_USER environment variable set");
+    callback({message: "Fatal error in getUserAccount"});
   }
+}
+
+function addAccountsToUserList_recursive(accounts, idx, callback) {
+  persistentLog(LOG_VERBOSE, 'addAccountsToUserList_recursive');
+
+  var size = accounts.length - idx < 1000 ? accounts.length - idx : 1000;
+  var fetchAccounts = accounts.slice(idx, idx + size);
+
+  persistentLog(LOG_VERBOSE, ' - addAccountsToUserList_recursive fetching info for ' + size + ' users from idx ' + idx);
+
+  steem.api.getAccounts(fetchAccounts, function (err, userAccounts) {
+    if (err || userAccounts === undefined || userAccounts === null) {
+      persistentLog(LOG_GENERAL, " - addAccountsToUserList_recursive error, can't get user accounts: " + err);
+      callback(err, false);
+      return;
+    }
+    persistentLog(LOG_VERBOSE, ' - - addAccountsToUserList_recursive fetched info for ' + userAccounts.length + ' users');
+    for (var k = 0; k < userAccounts.length; k++) {
+      // overwrite old info if exists (don't check for dup)
+      users[userAccounts[k].name] = userAccounts[k];
+    }
+    if (size < 1000) {
+      // finished
+      callback(null, true);
+    } else {
+      addAccountsToUserList_recursive(accounts, idx + size, callback);
+    }
+  });
 }
 
 function getFollowers_recursive(username, followers, callback) {
@@ -1922,107 +1805,41 @@ function getPosts_recursive(posts, stopAtPost, limit, callback) {
   });
 }
 
-/*
-persistString(key, string):
-*/
-function persistString(key, string, callback) {
-  redisClient.on("error", function (err) {
-    setError(null, false, "persistString redis error for key "+key+": "+err);
-    if (callback !== undefined) {
-      callback(err);
-    }
-  });
-  redisClient.set(key, string, function() {
-    persistentLog(LOG_VERBOSE, "persistString save for key "+key);
-    if (callback !== undefined) {
-      callback();
-    }
-  });
-}
-
-/*
-getPersistentString(key):
-*/
-function getPersistentString(key, callback) {
-  redisClient.on("error", function (err) {
-    setError(null, false, "getPersistentString redis _on_ error for key "+key+": "+err);
-    callback(err);
-  });
-  redisClient.get(key, function(err, reply) {
-    if (reply == null) {
-      setError(null, false, "getPersistentString redis error for key "+key+": "+err);
-      if (callback) {
-        callback(err);
-      }
-    } else {
-      if (callback !== undefined) {
-        try {
-          callback(null, reply);
-        } catch(err) {
-          callback(err);
-        }
-      }
-    }
-  });
-}
-
-/*
-persistJson(key, json):
-*/
-function persistJson(key, json, callback) {
-  redisClient.on("error", function (err) {
-    setError(null, false, "persistJson redis error for key "+key+": "+err);
-    if (callback !== undefined) {
-      callback(err);
-    }
-  });
-  var str = JSON.stringify(json);
-  persistentLog(LOG_VERBOSE, "persistJson for key "+key+", has JSON as str: "+str);
-  redisClient.set(key, str, function(err) {
+function persistObj(collection, obj, callback) {
+  db.collection(collection).count(function (err, count) {
     if (err) {
-      setError(null, false, "persistJson redis error for key "+key+": "+err.message);
-      if (callback !== undefined) {
-        callback(err);
-      }
+      console.error(err);
+      callback(err);
+      return;
+    } else if (count > 0) {
+      db.collection(collection).drop();
     } else {
-      persistentLog(LOG_VERBOSE, "persistJson save for key "+key);
-      if (callback !== undefined) {
+      console.log('Cant drop db ' + collection + ', no records');
+    }
+    db.collection(collection).save(obj, function (err, existing) {
+      if (err) {
+        console.error(err);
+        callback(err);
+      } else {
+        persistentLog(LOG_VERBOSE, "persistObj save to db "+collection);
         callback();
       }
+    });
+  });
+}
+
+function getPersistentObj(collection, callback) {
+  db.collection(collection).find({}).toArray(function(err, obj) {
+    if (err) {
+      callback(err);
+    } else if (obj !== undefined && obj !== null && obj.length !== 0){
+      callback(null, obj[0]);
+    } else {
+      callback(null, null);
     }
   });
 }
 
-/*
-getPersistentJson(key):
-*/
-function getPersistentJson(key, callback) {
-  redisClient.on("error", function (err) {
-    setError(null, false, "getPersistentJson redis _on_ error for key "+key+": "+err);
-    if (callback !== undefined) {
-      callback(err);
-    }
-  });
-  redisClient.get(key, function(err, reply) {
-    if (err) {
-      setError(null, false, "getPersistentJson redis error for key "+key+": "+err);
-      if (callback) {
-        callback(err);
-      }
-    } else {
-      if (callback) {
-        //persistentLog(LOG_VERBOSE, "getPersistentJson for key "+key+", raw: "+reply);
-        try {
-          var json = JSON.parse(reply);
-          callback(null, json);
-        } catch(err) {
-          setError(null, false, "getPersistentJson redis error for key "+key+": "+err.message);
-          callback(err);
-        }
-      }
-    }
-  });
-}
 
 /*
 updateWeightMetric(query, apiKey, callback):
@@ -2042,10 +1859,10 @@ function updateWeightMetric(query, apiKey, callback) {
     }
     return;
   }
-  getPersistentJson("algorithm", function(algorithmResult) {
+  getPersistentObj(DB_ALGORITHM, function(err1, algorithmResult) {
     if (algorithmResult != null) {
       algorithm = algorithmResult;
-      persistentLog(LOG_VERBOSE, " - updated algorithm from redis store: "+JSON.stringify(algorithm));
+      persistentLog(LOG_VERBOSE, " - updated algorithm from db: "+JSON.stringify(algorithm));
     }
     var match = false;
     for (var i = 0 ; i < algorithm.weights.length ; i++) {
@@ -2058,10 +1875,16 @@ function updateWeightMetric(query, apiKey, callback) {
     if (!match) {
       algorithm.weights.push(query);
     }
-    persistJson("algorithm", algorithm);
-    if (callback !== undefined) {
-      callback({status: 200, message: "Added key to algorithm: "+query.key});
-    }
+    persistentLog(LOG_VERBOSE, "algorithm to save: "+JSON.stringify(algorithm));
+    persistObj(DB_ALGORITHM, algorithm, function (err2, result) {
+      if (err2) {
+        console.error(err2);
+        callback({status: 200, message: "Failed to save updated" +
+        " algorithm: "+err2});
+      } else {
+        callback({status: 200, message: "Added key to algorithm: "+query.key});
+      }
+    });
   });
 }
 
@@ -2077,12 +1900,13 @@ function deleteWeightMetric(key, apiKey, callback) {
     }
     return;
   }
-  getPersistentJson("algorithm", function(err, algorithmResult) {
+  getPersistentObj(DB_ALGORITHM, function(err, algorithmResult) {
     if (err) {
-      persistentLog(LOG_VERBOSE, " - coudln't from redis store, using local version");
+      persistentLog(LOG_VERBOSE, " - coudln't get from db, using" +
+        " local version");
     } else {
       algorithm = algorithmResult;
-      persistentLog(LOG_VERBOSE, " - updated algorithm from redis store: "+JSON.stringify(algorithm));
+      persistentLog(LOG_VERBOSE, " - updated algorithm from db: "+JSON.stringify(algorithm));
     }
     var newWeights = [];
     for (var i = 0 ; i < algorithm.weights.length ; i++) {
@@ -2091,10 +1915,11 @@ function deleteWeightMetric(key, apiKey, callback) {
       } // else don't add, effectively delete
     }
     algorithm.weights = newWeights;
-    persistJson("algorithm", algorithm);
-    if (callback !== undefined) {
-      callback({status: 200, message: "Removed key from algorithm: "+key});
-    }
+    persistObj(DB_ALGORITHM, algorithm, function(err, data) {
+      if (callback !== undefined) {
+        callback({status: 200, message: "Removed key from algorithm: "+key});
+      }
+    });
   });
 }
 
@@ -2112,9 +1937,10 @@ function updateMetricList(list, contents, apiKey, callback) {
   }
   // format contents
   var parts = S(contents.replace("  ", " ")).splitLeft(" ");
-  getPersistentJson("algorithm", function(err, algorithmResult) {
+  getPersistentObj(DB_ALGORITHM, function(err, algorithmResult) {
     if (err) {
-      persistentLog(LOG_VERBOSE, " - coudln't from redis store, using local version");
+      persistentLog(LOG_VERBOSE, " - coudln't from db, using local" +
+        " version");
       if (algorithm === undefined || algorithm == null) {
         algorithm = {
           weights: [],
@@ -2130,114 +1956,155 @@ function updateMetricList(list, contents, apiKey, callback) {
       }
     } else {
       algorithm = algorithmResult;
-      persistentLog(LOG_VERBOSE, " - updated algorithm from redis store: "+JSON.stringify(algorithm));
+      persistentLog(LOG_VERBOSE, " - updated algorithm from db: "+JSON.stringify(algorithm));
     }
     algorithm[list] = parts;
-    persistJson("algorithm", algorithm);
-    if (callback !== undefined) {
-      callback({status: 200, message: "Updated black / white list: "+list});
-    }
+    persistObj(DB_ALGORITHM, algorithm, function(err, data) {
+      if (callback !== undefined) {
+        callback({status: 200, message: "Updated black / white list: "+list});
+      }
+    });
   });
 }
 
-function savePostsMetadata(postsMetadataObj, callback) {
+function savePostsMetadata(callback) {
   persistentLog(LOG_VERBOSE, "savePostsMetadata");
-  redisClient.get("postsMetadata_keys", function(err, keys) {
-    // get keys and update which to keep and which to remove
-    var objToKeep = [];
-    var keysToRemove = [];
-    if (err || keys === undefined || keys == null) {
-      persistentLog(LOG_VERBOSE, " - postsMetadata_keys doesn't exist, probably first time run");
+  db.collection(DB_POSTS_METADATA).find({}).toArray(function(err, postsMetaDataResults) {
+    if (err || postsMetaDataResults === null && postsMetaDataResults.length === 0 || postsMetaDataResults[0] === null) {
+      console.log("Couldn't access posts metadata");
+      if (callback !== undefined) {
+        callback({status: 500, message: "savePostsMetadata, error saving" +
+          " new object: " + err.message});
+      }
     } else {
-      var keysObj = JSON.parse(keys);
-      if (keysObj == null) {
-        persistentLog(LOG_VERBOSE, " - postsMetadata_keys couldn't be parsed, probably first time run");
-      } else {
-        persistentLog(LOG_VERBOSE, " - removing old keys");
-        // only keep keys under DAYS_KEEP_LOGS days old
-        for (var i = 0 ; i < keysObj.keys.length ; i++) {
-          if (((new Date()).getTime() - keysObj.keys[i].date) <= (configVars.DAYS_KEEP_LOGS * MILLIS_IN_DAY)) {
-            objToKeep.push(keysObj.keys[i]);
-          } else {
-            keysToRemove.push(keysObj.keys[i].key);
+      // get summary details before removing data
+      var numPosts = postsMetadata.length;
+      var numVotes = 0;
+      for (var j = 0; j < postsMetadata.length; j++) {
+        if (postsMetadata[j].vote) {
+          numVotes++;
+        }
+      }
+      // then remove
+      var numRemoved = 0;
+      var postsMetaDataResultsRemaining = [];
+      for (var i = 0 ; i < postsMetaDataResults.length ; i++) {
+        if (((new Date()).getTime() - postsMetaDataResults[i].date) > (configVars.DAYS_KEEP_LOGS * MILLIS_IN_DAY)) {
+          // remove
+          db.collection(DB_POSTS_METADATA).remove(postsMetaDataResults[i], function (err, data) {
+            if (err) {
+              persistentLog(LOG_GENERAL, " - - failed to remove old" +
+                " posts metadata obj");
+            }
+          });
+          numRemoved++;
+        } else {
+          postsMetaDataResultsRemaining.push(postsMetaDataResults[i]);
+        }
+      }
+      persistentLog(LOG_VERBOSE, " - - - removed " + numRemoved + " runs of post metadata from db due to age");
+      if (postsMetaDataResultsRemaining.length > configVars.POST_METADATA_MAX_RUNS_TO_KEEP) {
+        persistentLog(LOG_VERBOSE, " - - - removing a further " + (postsMetaDataResultsRemaining.length - configVars.POST_METADATA_MAX_RUNS_TO_KEEP) + " runs of post metadata from db");
+        var postsMetaDataResultsToRemove = postsMetaDataResultsRemaining.slice(0, configVars.POST_METADATA_MAX_RUNS_TO_KEEP);
+        for (var i = 0 ; i < postsMetaDataResultsToRemove.length ; i++) {
+          db.collection(DB_POSTS_METADATA).remove(postsMetaDataResultsToRemove[i], function (err, data) {
+            if (err) {
+              persistentLog(LOG_GENERAL, " - - failed to remove old" +
+                " posts metadata obj");
+            }
+          });
+        }
+      }
+      // cut posts metadata list down
+      if (postsMetadata.length > configVars.POST_METADATA_MAX_RECORD_PER_RUN) {
+        persistentLog(LOG_VERBOSE, " - - cutting number of posts metadata saved from " + postsMetadata.length + " to " + configVars.POST_METADATA_MAX_RECORD_PER_RUN);
+        postsMetadata = postsMetadata.slice(0, configVars.POST_METADATA_MAX_RECORD_PER_RUN);
+      }
+      // save
+      var timestamp = (new Date()).getTime();
+      var dateTime = moment_tz.tz(timestamp, configVars.TIME_ZONE);
+      // add new obj
+      var postsMetadataList = {
+        date: timestamp,
+        date_str: (dateTime.format("MM/DD/YY HH:mm")),
+        date_day: dateTime.date(),
+        num_posts: numPosts,
+        num_votes: numVotes,
+        posts_metadata_list: postsMetadata
+      };
+      db.collection(DB_POSTS_METADATA).save(postsMetadataList, function (err, data) {
+        if (err) {
+          persistentLog(LOG_GENERAL, " - - error saving posts metadata");
+          if (callback !== undefined) {
+            callback({status: 500, message: "savePostsMetadata, error saving" +
+              " new object: " + err.message});
+          }
+        } else {
+          persistentLog(LOG_VERBOSE, " - - saved posts metadata");
+          if (callback !== undefined) {
+            callback({status: 200, message: "savePostsMetadata, success, saved postsMetadata"});
           }
         }
-        persistentLog(LOG_VERBOSE, " - - keeping "+objToKeep.length+" of "+keysObj.keys.length+" keys");
-      }
-    }
-    // add supplied key to keep list
-    var stringifiedJson = JSON.stringify(postsMetadataObj);
-    var key = extra.calcMD5(stringifiedJson);
-    persistentLog(LOG_VERBOSE, " - adding new postsMetadata key: "+key);
-    objToKeep.push({date: (new Date()).getTime(), key: key});
-    redisClient.set("postsMetadata_keys", JSON.stringify({keys: objToKeep}), function(err, setResult1) {
-      if (err) {
-        persistentLog(LOG_GENERAL, "savePostsMetadata, error setting updated keys: "+err.message);
-        persistentLog(LOG_GENERAL, "postsMetadata, removing "+keysToRemove.length+" keys");
-        removePostsMetadataKeys(keysToRemove, 0, function(err) {
-          if (err) {
-            persistentLog(LOG_GENERAL, "postsMetadata, error removing keys");
-          }
-          if (callback !== undefined) {
-            callback({status: 500, message: "savePostsMetadata, error setting updated keys: " + err.message});
-          }
-        });
-        return;
-      }
-      persistentLog(LOG_VERBOSE, " - adding new postsMetadata under key: "+key);
-      redisClient.set(key, stringifiedJson, function(err, setResult2) {
-        persistentLog(LOG_GENERAL, "postsMetadata, removing "+keysToRemove.length+" keys");
-        removePostsMetadataKeys(keysToRemove, 0, function(err2) {
-          if (err2) {
-            persistentLog(LOG_GENERAL, "postsMetadata, error removing keys");
-          }
-          if (err) {
-            persistentLog(LOG_GENERAL, "savePostsMetadata, error setting new object with key: "+err.message);
-            if (callback !== undefined) {
-              callback({status: 500, message: "savePostsMetadata, error setting new object with key: " + err.message});
-            }
-          }
-          persistentLog(LOG_GENERAL, " - finished saving postsMetadata");
-          if (callback !== undefined) {
-            callback({status: 200, message: "savePostsMetadata, success, saved postsMetadata with key: " + key});
-          }
-        });
       });
-    });
-  });
-}
-
-function removePostsMetadataKeys(toRemove, idx, callback) {
-  if (idx < toRemove.length) {
-    redisClient.del(toRemove[idx], function(err, result) {
-      if (err) {
-        callback(err);
-      } else {
-        removePostsMetadataKeys(toRemove, idx + 1, callback);
-      }
-    });
-  } else {
-    callback();
-  }
-}
-
-function getPostsMetadataKeys(callback) {
-  persistentLog(LOG_VERBOSE, "getPostsMetadataKeys");
-  persistentLog(LOG_VERBOSE, " - getting keys");
-  redisClient.get("postsMetadata_keys", function(err, keys) {
-    if (err) {
-      persistentLog(LOG_VERBOSE, "getPostsMetadataKeys, error: "+err.message);
-      callback({status: 500, message: "getPostsMetadataKeys, error: "+err.message}, []);
-    } else if (keys == null) {
-      persistentLog(LOG_VERBOSE, "getPostsMetadataKeys, error: no result");
-      callback({status: 500, message: "getPostsMetadataKeys, error: no result"}, []);
-    } else {
-      persistentLog(LOG_VERBOSE, " - parsing keys");
-      var keysObj = JSON.parse(keys);
-      persistentLog(LOG_VERBOSE, " - returning keys");
-      callback(null, keysObj.keys);
     }
   });
+}
+
+function getPostsMetadataList(date, callback) {
+  persistentLog(LOG_VERBOSE, " - fetching posts metadata for date: "+date);
+  db.collection(DB_POSTS_METADATA).find({"date": Number(date)}).toArray(function(err, postsMetaDataResults) {
+    if (err || postsMetaDataResults === undefined || postsMetaDataResults === null
+        || postsMetaDataResults.length === 0 || postsMetaDataResults[0] === undefined
+        || postsMetaDataResults[0] === null) {
+      callback(err, null);
+    } else {
+      callback(null, postsMetaDataResults[0].posts_metadata_list);
+    }
+  });
+}
+
+function getPostsMetadataAllDates(callback) {
+  db.collection(DB_POSTS_METADATA).find({}).toArray(function(err, postsMetaDataResults) {
+    if (err || postsMetaDataResults === null && postsMetaDataResults.length === 0) {
+      callback(err, null);
+    } else {
+      var result = [];
+      for (var i = 0 ; i < postsMetaDataResults.length ; i++) {
+        result.push(postsMetaDataResults[i].date);
+      }
+      callback(null, result);
+    }
+  });
+}
+
+function getPostsMetadataSummary(callback) {
+  var summary = [];
+  db.collection(DB_POSTS_METADATA).find({}).count(function(err, count) {
+      if (err) {
+        console.error(err);
+        callback(summary);
+      } else {
+        var recordsCount = count;
+        db.collection(DB_POSTS_METADATA).find({}).forEach(function(doc) {
+          wait.launchFiber(function() {
+            delete doc.posts_metadata_list;
+            summary.push(doc);
+
+            // TODO : use a better method than a counter to know when forEach done
+            if (--recordsCount <= 0) {
+              // done
+              persistentLog(LOG_VERBOSE, "Finished getPostsMetadataSummary");
+              callback(summary);
+            }
+          });
+        }, function(err) {
+          if (err) {
+            console.error(err);
+            callback(summary);
+          }
+        });
+      }
+    });
 }
 
 /*
@@ -2256,7 +2123,7 @@ function getSteemPowerFromVest(vest) {
       parseFloat(steemGlobalProperties.total_vesting_fund_steem)
     );
   } catch(err) {
-    setError(null, false, "Error formatting owner vest shares to Steem");
+    console.error(err);
   }
   return 0;
 }
@@ -2291,7 +2158,7 @@ function updateConfigVars(newConfigVars, callback) {
   }
   configVars = newConfigVars;
   persistentLog(LOG_VERBOSE, "updateConfigVars: "+JSON.stringify(newConfigVars));
-  persistJson("config_vars", newConfigVars, function(err) {
+  persistObj(DB_CONFIG_VARS, newConfigVars, function(err) {
     if (err) {
       persistentLog(LOG_VERBOSE, "Error updating config vars: "+err.message);
       callback({message: "Fatal error in updateConfigVars"});
@@ -2301,92 +2168,10 @@ function updateConfigVars(newConfigVars, callback) {
   })
 }
 
-/*
-* Manage internal state
-*/
 
 /*
-setError(status, isFatal, message):
-* Set general error for server
+* Util
 */
-function setError(status, isFatal, message) {
-	if (status) {
-    serverState = status;
-  }
-  fatalError = !fatalError && isFatal;
-  console.log("setError to \""+serverState+"\" "+(isFatal ? "(FATAL) " : "")+(message ? ", "+message : ""));
-}
-
-/*
-hasFatalError():
-*/
-function hasFatalError() {
-	return fatalError;
-}
-
-/*
-getServerState():
-*/
-function getServerState() {
-	return serverState;
-}
-
-/*
-showFatalError()
-* Show message for fatal error check.
-* return: true if fatal error
-*/
-function showFatalError() {
-  if (fatalError) {
-    console.log("cannot process initSteem function, fatal error has already occured. Please fix and restart server");
-  }
-  return fatalError;
-}
-
-
-/*
-* Email
-*/
-
-/*
-sendEmail(subject, message)
-* Send email using SendGrid, if set up. Fails cleanly if not.
-*/
-function sendEmail(subject, message, isHtml, callback) {
-	if (!process.env.SENDGRID_API_KEY || !process.env.EMAIL_ADDRESS_TO
-    || process.env.EMAIL_ADDRESS_TO.localeCompare("none") == 0) {
-		persistentLog(LOG_GENERAL, "Can't send email, config vars not set. Subject: "+subject);
-		callback();
-		return false;
-	}
-  persistentLog(LOG_VERBOSE, "sendEmail to:"+process.env.EMAIL_ADDRESS_TO+", subject: "+subject);
-	var helper = require('sendgrid').mail;
-	var from_email = new helper.Email((process.env.EMAIL_ADDRESS_SENDER 
-      && process.env.EMAIL_ADDRESS_SENDER.localeCompare("none") != 0)
-		? process.env.EMAIL_ADDRESS_SENDER : 'bot@fossbot.org');
-	var to_email = new helper.Email(process.env.EMAIL_ADDRESS_TO);
-	var content = new helper.Content(isHtml ? 'text/html' : 'text/plain', message);
-	var mail = new helper.Mail(from_email, subject, to_email, content);
-
-	var sg = require('sendgrid')(process.env.SENDGRID_API_KEY);
-	var request = sg.emptyRequest({
-		method: 'POST',
-		path: '/v3/mail/send',
-		body: mail.toJSON(),
-	});
-
-	persistentLog(LOG_VERBOSE, "sending email");
-	sg.API(request, function(err, response) {
-    if (err) {
-      persistentLog(LOG_VERBOSE, " - error sending email: "+err.message);
-    } else {
-      persistentLog(LOG_VERBOSE, " - send email, status: "+response.statusCode);
-    }
-    if (callback !== undefined) {
-      callback();
-    }
-	});
-}
 
 function clone(obj) {
   var copy;
@@ -2431,52 +2216,52 @@ testEnvVars():
 * Test environment variables and log results
 */
 function testEnvVars(callback) {
-  if (showFatalError()) {
-    callback({message: "Fatal error in testEnvVars"});
-    return;
-  }
   console.log("steem user: "+process.env.STEEM_USER);
   if (!process.env.STEEM_USER) {
-    setError("init_error", true, "No STEEM_USER config var set, minimum env vars requirements not met");
+    console.error("No STEEM_USER config var set, minimum env vars requirements not met");
   }
   console.log("private posting key?: "+(process.env.POSTING_KEY_PRV ? "true" : "false"));
   if (!process.env.POSTING_KEY_PRV) {
-    setError("init_error", true, "No POSTING_KEY_PRV config var set, minimum env vars requirements not met");
+    console.error("No POSTING_KEY_PRV config var set, minimum env vars requirements not met");
   }
   console.log("api key?: "+(process.env.BOT_API_KEY ? "true" : "false"));
   if (!process.env.BOT_API_KEY) {
-    setError("init_error", true, "No BOT_API_KEY config var set, minimum env vars requirements not met");
+    console.error("No BOT_API_KEY config var set, minimum env vars requirements not met");
   }
 
-  console.log("SendGrid API key?: "+(process.env.SENDGRID_API_KEY ? "true" : "false"));
-  console.log("email address to: "+process.env.EMAIL_ADDRESS_TO);
-  console.log("email address sender: "+process.env.EMAIL_ADDRESS_SENDER);
+  callback();
+}
 
-  if (!fatalError) {
-    serverState = "started";
-    callback();
-  } else {
-    callback({message: "Error in testEnvVars"});
-  }
+function startDb(callback) {
+  mongodb.MongoClient.connect(process.env.MONGODB_URI, function (err, database) {
+    if (err) {
+      console.log(err);
+      callback(err);
+    } else {
+      db = database;
+      console.log("Database connection ready");
+      callback();
+    }
+  });
 }
 
 
 /* Set public API */
+module.exports.DB_ALGORITHM = DB_ALGORITHM;
+
 module.exports.runBot = runBot;
 module.exports.testEnvVars = testEnvVars;
-module.exports.initSteem = initSteem;
-module.exports.setError = setError;
-module.exports.hasFatalError = hasFatalError;
-module.exports.getServerState = getServerState;
-module.exports.showFatalError = showFatalError;
-module.exports.sendEmail = sendEmail;
-module.exports.persistJson = persistJson;
-module.exports.getPersistentJson = getPersistentJson;
-module.exports.getPersistentString = getPersistentString;
+module.exports.initLib = initLib;
+module.exports.persistObj = persistObj;
+module.exports.getPersistentObj = getPersistentObj;
+module.exports.getDailyLikedPosts = getDailyLikedPosts;
 module.exports.updateWeightMetric = updateWeightMetric;
 module.exports.deleteWeightMetric = deleteWeightMetric;
 module.exports.updateMetricList = updateMetricList;
-module.exports.getPostsMetadataKeys = getPostsMetadataKeys;
+module.exports.getPostsMetadataList = getPostsMetadataList;
+module.exports.getPostsMetadataAllDates = getPostsMetadataAllDates;
+module.exports.getPostsMetadataSummary = getPostsMetadataSummary;
 module.exports.getEpochMillis = getEpochMillis;
 module.exports.getConfigVars = getConfigVars;
 module.exports.updateConfigVars = updateConfigVars;
+© 2018 GitHub, Inc.
